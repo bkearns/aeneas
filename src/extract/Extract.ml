@@ -718,22 +718,16 @@ let extract_texpr_errors (fmt : F.formatter) =
     As a consequence, the code which *consumes* such a type must not match on
     its constructors (they are not constructors anymore, but plain definitions),
     but test the [disc] field instead: this is what {!is_wide_enum} is used for
-    below.
-
-    TODO: this duplicates the shared predicate which the type emission side
-    provides ({!WideEnum.threshold} and {!WideEnum.is_wide_enum}); replace these
-    two definitions by the shared ones once they have landed, and only keep one
-    copy of this comment. *)
-let wide_enum_threshold = 244
+    below. [WideEnum] owns the threshold and the backend test, so the emitter of
+    the type and the emitter of the matches cannot drift apart. *)
+let wide_enum_threshold = WideEnum.threshold
 
 (** Return [true] if the given type declaration is extracted to a tagged
     structure because it has too many variants for Lean. See
-    {!wide_enum_threshold}. *)
+    {!WideEnum.is_wide_enum}, which owns the threshold and the backend test; the
+    two sides of this encoding must agree on both. *)
 let is_wide_enum (ctx : extraction_ctx) (id : TypeDeclId.id) : bool =
-  match TypeDeclId.Map.find_opt id ctx.trans_types with
-  | Some { kind = Enum variants; _ } ->
-      List.length variants > wide_enum_threshold
-  | Some { kind = Struct _ | Opaque; _ } | None -> false
+  WideEnum.is_wide_enum ctx id
 
 (** Return the id of the enumeration the type is, if this enumeration is
     extracted to a tagged structure (see {!is_wide_enum}).
