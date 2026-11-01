@@ -973,6 +973,75 @@ let extract_type_decl_variant (span : Meta.span) (ctx : extraction_ctx)
   (* Close the variant box *)
   F.pp_close_box fmt ()
 
+(** Print the body of an enumeration which we extract with the tag model, i.e.
+    as a structure instead of as an inductive (see {!WideEnum}).
+
+    We generate:
+    {[
+      structure Foo where
+        disc : Std.U16
+        f3 : Option (Std.U32 × Bool) := none
+    ]}
+
+    The payload fields are given a default value so that the constructor
+    functions (see {!extract_type_decl_wide_enum_constructors}) only have to
+    provide the discriminant and the payload of the variant they build.
+
+    Note that we already printed: [structure Foo where] *)
+let extract_type_decl_wide_enum_body (ctx : extraction_ctx) (fmt : F.formatter)
+    (type_decl_group : TypeDeclId.Set.t) (def : type_decl)
+    (variants : variant list) : unit =
+  let span = def.item_meta.span in
+  (* Print the fields on their own lines, indented (as for the structures) *)
+  F.pp_print_break fmt 1 ctx.indent_incr;
+  F.pp_open_vbox fmt 0;
+  (* We print each field in its own box so that it stays on one line whenever
+     possible (we are inside a vertical box) *)
+  let first = ref true in
+  let print_field (name : string) (print_ty : F.formatter -> unit) : unit =
+    if !first then first := false else F.pp_print_space fmt ();
+    F.pp_open_box fmt ctx.indent_incr;
+    F.pp_print_string fmt name;
+    F.pp_print_space fmt ();
+    F.pp_print_string fmt ":";
+    F.pp_print_space fmt ();
+    print_ty fmt;
+    F.pp_close_box fmt ()
+  in
+  (* The discriminant. We always use [Std.U16], which is much more than enough
+     for the enums we can represent (and which is what the [if x.disc = ...]
+     tests generated for the matches expect). *)
+  print_field "disc" (fun fmt -> F.pp_print_string fmt "Std.U16");
+  (* One payload field per variant which has one, named after the index of the
+     variant (the matches then project from [x.f<i>]). We give those fields a
+     default value: the constructor functions only need to provide the tag and
+     the payload of the variant they build. *)
+  List.iteri
+    (fun i (v : variant) ->
+      match v.fields with
+      | [] -> ()
+      | fields ->
+          print_field
+            ("f" ^ string_of_int i)
+            (fun fmt ->
+              F.pp_print_string fmt "Option";
+              F.pp_print_space fmt ();
+              F.pp_print_string fmt "(";
+              Collections.List.iter_link
+                (fun () ->
+                  F.pp_print_space fmt ();
+                  F.pp_print_string fmt "×";
+                  F.pp_print_space fmt ())
+                (fun (f : field) ->
+                  extract_ty span ctx fmt type_decl_group ~inside:false
+                    f.field_ty)
+                fields;
+              F.pp_print_string fmt ")";
+              F.pp_print_space fmt ();
+              F.pp_print_string fmt ":= none"))
+    variants;
+  F.pp_close_box fmt ()
+
 (* TODO: we don' need the [def_name] paramter: it can be retrieved from the context *)
 let extract_type_decl_enum_body (ctx : extraction_ctx) (fmt : F.formatter)
     (type_decl_group : TypeDeclId.Set.t) (def : type_decl) (def_name : string)
@@ -1490,6 +1559,9 @@ let extract_type_decl_gen (ctx : extraction_ctx) (fmt : F.formatter)
   let use_forall = is_opaque_coq && def.generics <> empty_generic_params in
   (* Retrieve the definition name *)
   let def_name = ctx_get_local_type span def.def_id ctx in
+  (* Check if this is an enumeration which we must extract with the tag model
+     (Lean rejects inductives with too many constructors: see [WideEnum]) *)
+  let wide = WideEnum.is_wide_enum ctx def.def_id in
   (* Add the type and const generic params - note that we need those bindings only for the
    * body translation (they are not top-level) *)
   let ctx_body, type_params, cg_params, trait_clauses =
@@ -1608,7 +1680,7 @@ let extract_type_decl_gen (ctx : extraction_ctx) (fmt : F.formatter)
   (* Open a box for "type TYPE_NAME (TYPE_PARAMS CONST_GEN_PARAMS) =" *)
   F.pp_open_hovbox fmt ctx.indent_incr;
   (* > "type TYPE_NAME" *)
-  let qualif = type_decl_kind_to_qualif span kind type_kind in
+  let qualif = type_decl_kind_to_qualif span ~wide kind type_kind in
   (match qualif with
   | Some qualif -> F.pp_print_string fmt (qualif ^ " " ^ def_name)
   | None -> F.pp_print_string fmt def_name);
@@ -1660,8 +1732,12 @@ let extract_type_decl_gen (ctx : extraction_ctx) (fmt : F.formatter)
            extract_type_decl_struct_body ctx_body fmt type_decl_group kind def
              type_params cg_params fields
      | Enum variants ->
-         extract_type_decl_enum_body ctx_body fmt type_decl_group def def_name
-           type_params cg_params variants
+         if wide then
+           extract_type_decl_wide_enum_body ctx_body fmt type_decl_group def
+             variants
+         else
+           extract_type_decl_enum_body ctx_body fmt type_decl_group def def_name
+             type_params cg_params variants
      | Opaque -> [%craise] span "Unreachable");
   (* Add the definition end delimiter *)
   if backend () = HOL4 && decl_is_not_last_from_group kind then (
@@ -1677,6 +1753,122 @@ let extract_type_decl_gen (ctx : extraction_ctx) (fmt : F.formatter)
   (* Add breaks to insert new lines between definitions *)
   if backend () <> HOL4 || decl_is_not_last_from_group kind then
     F.pp_print_break fmt 0 0
+
+(** Emit the constructor functions of the enumerations which we extract with the
+    tag model (see {!WideEnum}).
+
+    Such an enumeration is a structure: it doesn't have constructors anymore. We
+    thus emit one function per variant, with the name the constructor used to
+    have, so that all the places which build values of this type (in the
+    generated code as well as in the proofs) don't need to change:
+
+    {[
+      def Foo.Bar (a0 : Std.U32) : Foo :=
+        { disc := UScalar.ofNatCore 3 (by decide), f3 := some a0 }
+
+      def Foo.Baz : Foo := { disc := UScalar.ofNatCore 4 (by decide) }
+    ]}
+
+    Remark: Lean has no [OfNat] instance for [U16], hence the
+    [UScalar.ofNatCore ... (by decide)] literals.
+
+    Those definitions must be emitted *after* the type declaration group: they
+    use the type, and the group might be recursive. *)
+let extract_type_decl_wide_enum_constructors (ctx : extraction_ctx)
+    (fmt : F.formatter) (type_decl_group : TypeDeclId.Set.t)
+    (dg : type_decl list) : unit =
+  if backend () = Lean then
+    List.iter
+      (fun def ->
+        match def.kind with
+        | Enum variants when WideEnum.is_wide_enum ctx def.def_id ->
+            let span = def.item_meta.span in
+            let def_name = ctx_get_local_type span def.def_id ctx in
+            (* We need the generic parameters to be bound in the context to print
+               the types of the payloads *)
+            let ctx_body, type_params, cg_params, trait_clauses =
+              ctx_add_generic_params span def.item_meta.name Item
+                def.llbc_generics def.generics ctx
+            in
+            let params =
+              List.concat [ type_params; cg_params; trait_clauses ]
+            in
+            List.iteri
+              (fun vid (v : variant) ->
+                let cons_name =
+                  ctx_get_variant span (TAdtId def.def_id)
+                    (VariantId.of_int vid) ctx
+                in
+                let fields = FieldId.mapi (fun fid f -> (fid, f)) v.fields in
+                (* > "def TYPE_NAME.VARIANT" *)
+                F.pp_print_break fmt 0 0;
+                F.pp_open_hovbox fmt ctx.indent_incr;
+                F.pp_print_string fmt ("def " ^ cons_name);
+                (* The generic parameters are implicit: they are inferred from
+                   the payload *)
+                extract_generic_params span ctx_body fmt type_decl_group Item
+                  ~as_implicits:true def.generics None type_params cg_params
+                  trait_clauses;
+                (* > "(a0 : TY0) (a1 : TY1)" *)
+                List.iter
+                  (fun (fid, (f : field)) ->
+                    F.pp_print_space fmt ();
+                    F.pp_open_box fmt ctx.indent_incr;
+                    F.pp_print_string fmt ("(a" ^ FieldId.to_string fid ^ " :");
+                    F.pp_print_space fmt ();
+                    extract_ty span ctx_body fmt type_decl_group ~inside:false
+                      f.field_ty;
+                    F.pp_print_string fmt ")";
+                    F.pp_close_box fmt ())
+                  fields;
+                (* > ": TYPE_NAME PARAMS :=" *)
+                F.pp_print_space fmt ();
+                F.pp_print_string fmt ":";
+                F.pp_print_space fmt ();
+                F.pp_print_string fmt def_name;
+                List.iter
+                  (fun p ->
+                    F.pp_print_space fmt ();
+                    F.pp_print_string fmt p)
+                  params;
+                F.pp_print_space fmt ();
+                F.pp_print_string fmt ":=";
+                F.pp_close_box fmt ();
+                (* The value: the tag, then the payload of this variant (the
+                   other payload fields keep their default value) *)
+                F.pp_print_break fmt 1 ctx.indent_incr;
+                F.pp_open_hovbox fmt 0;
+                F.pp_print_string fmt
+                  ("{ disc := UScalar.ofNatCore " ^ string_of_int vid);
+                F.pp_print_space fmt ();
+                F.pp_print_string fmt "(by decide)";
+                (match fields with
+                | [] -> ()
+                | [ (fid, _) ] ->
+                    F.pp_print_string fmt ",";
+                    F.pp_print_space fmt ();
+                    F.pp_print_string fmt
+                      ("f" ^ string_of_int vid ^ " := some a"
+                     ^ FieldId.to_string fid)
+                | _ :: _ :: _ ->
+                    F.pp_print_string fmt ",";
+                    F.pp_print_space fmt ();
+                    F.pp_print_string fmt
+                      ("f" ^ string_of_int vid ^ " := some (");
+                    Collections.List.iter_link
+                      (fun () ->
+                        F.pp_print_string fmt ",";
+                        F.pp_print_space fmt ())
+                      (fun (fid, _) ->
+                        F.pp_print_string fmt ("a" ^ FieldId.to_string fid))
+                      fields;
+                    F.pp_print_string fmt ")");
+                F.pp_print_space fmt ();
+                F.pp_print_string fmt "}";
+                F.pp_close_box fmt ())
+              variants
+        | Enum _ | Struct _ | Opaque -> ())
+      dg
 
 (** Extract an opaque type declaration to HOL4.
 
