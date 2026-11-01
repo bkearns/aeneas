@@ -1381,9 +1381,14 @@ let initialize_names_maps () : names_maps =
 
     For instance: "type", "and", etc.
 
+    [wide] is [{true}] for the Lean enumerations which we extract with the tag
+    model instead of as inductives (see {!WideEnum.is_wide_enum}), because Lean
+    rejects inductives with too many constructors: those are extracted as
+    structures.
+
     Remark: can return [None] for some backends like HOL4. *)
-let type_decl_kind_to_qualif (span : Meta.span) (kind : decl_kind)
-    (type_kind : type_decl_kind option) : string option =
+let type_decl_kind_to_qualif (span : Meta.span) ?(wide : bool = false)
+    (kind : decl_kind) (type_kind : type_decl_kind option) : string option =
   match backend () with
   | FStar -> (
       match kind with
@@ -1420,8 +1425,11 @@ let type_decl_kind_to_qualif (span : Meta.span) (kind : decl_kind)
           match type_kind with
           | Some Tuple -> Some "def"
           | Some Struct -> Some "structure"
+          (* Wide enums use the tag model: a structure with a [disc] field *)
+          | Some Enum when wide -> Some "structure"
           | _ -> Some "inductive")
-      | SingleRec | MutRecFirst | MutRecInner | MutRecLast -> Some "inductive"
+      | SingleRec | MutRecFirst | MutRecInner | MutRecLast ->
+          if wide then Some "structure" else Some "inductive"
       | Builtin -> Some "def"
       | Declared -> Some "def")
   | HOL4 -> None

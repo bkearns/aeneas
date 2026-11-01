@@ -802,6 +802,10 @@ let export_types_group (fmt : Format.formatter) (config : gen_config)
         export_type_decl kind def)
       defs;
     Extract.end_type_decl_group fmt is_rec defs;
+    (* The enumerations which we extract with the tag model are structures, not
+       inductives: we emit their "constructors" as functions, right after the
+       group (they use the types of the group, which might be recursive). *)
+    Extract.extract_type_decl_wide_enum_constructors ctx fmt ids_set defs;
 
     (* Export the extra information (ex.: [Arguments] instructions in Coq) *)
     List.iteri
