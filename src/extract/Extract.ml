@@ -706,6 +706,58 @@ let extract_texpr_errors (fmt : F.formatter) =
   | Lean -> F.pp_print_string fmt "sorry"
   | HOL4 -> F.pp_print_string fmt "(* ERROR: could not generate the code *)"
 
+(** The maximum number of constructors an inductive may have in Lean.
+
+    Lean refuses to define an inductive with more than [wide_enum_threshold]
+    constructors (`tag for constructor 'X.c244' is too big`). An enumeration
+    with more variants is thus extracted to a tagged structure instead of an
+    inductive: a [disc] field holding the discriminant (a [Std.U16]) and, for
+    each variant index [i] which has fields, an [f<i>] field holding its payload
+    as an option (the constructors are then [def]s which fill those fields).
+
+    As a consequence, the code which *consumes* such a type must not match on
+    its constructors (they are not constructors anymore, but plain definitions),
+    but test the [disc] field instead: this is what {!is_wide_enum} is used for
+    below.
+
+    TODO: this duplicates the shared predicate which the type emission side
+    provides ({!WideEnum.threshold} and {!WideEnum.is_wide_enum}); replace these
+    two definitions by the shared ones once they have landed, and only keep one
+    copy of this comment. *)
+let wide_enum_threshold = 244
+
+(** Return [true] if the given type declaration is extracted to a tagged
+    structure because it has too many variants for Lean. See
+    {!wide_enum_threshold}. *)
+let is_wide_enum (ctx : extraction_ctx) (id : TypeDeclId.id) : bool =
+  match TypeDeclId.Map.find_opt id ctx.trans_types with
+  | Some { kind = Enum variants; _ } ->
+      List.length variants > wide_enum_threshold
+  | Some { kind = Struct _ | Opaque; _ } | None -> false
+
+(** Return the id of the enumeration the type is, if this enumeration is
+    extracted to a tagged structure (see {!is_wide_enum}).
+
+    Note that we only need to look at the head of the type: a wide enumeration
+    is always a user-defined type (a builtin type has a fixed number of
+    variants). *)
+let ty_as_wide_enum (ctx : extraction_ctx) (ty : ty) : TypeDeclId.id option =
+  match ty with
+  | TAdt (TAdtId id, _) when is_wide_enum ctx id && backend () = Lean -> Some id
+  | _ -> None
+
+(** Return [true] if the expression is a variable (possibly wrapped in
+    meta-information).
+
+    We need this to print projections like [x.f0]: a projection binds stronger
+    than an application in Lean, so the projected expression must be atomic
+    (otherwise [f y.f0] would parse as [f (y.f0)]). *)
+let rec texpr_is_var (e : texpr) : bool =
+  match e.e with
+  | FVar _ -> true
+  | Meta (_, e) -> texpr_is_var e
+  | _ -> false
+
 (** - [inside_do]: [true] if we are inside a do block. In Lean, controls whether
       we can print let-bindings or if we need to insert a [do] first. *)
 let rec extract_texpr (span : Meta.span) (ctx : extraction_ctx)
@@ -731,8 +783,14 @@ let rec extract_texpr (span : Meta.span) (ctx : extraction_ctx)
       (* We use the app case *)
       extract_App span ctx fmt ~inside ~inside_do e [] e.ty
   | Let (_, _, _, _) -> extract_lets span ctx fmt ~inside ~inside_do e
-  | Switch (scrut, body) ->
-      extract_Switch span ctx fmt ~inside ~inside_do scrut body
+  | Switch (scrut, body) -> (
+      (* If the enumeration is extracted to a tagged structure (because it has
+         too many variants for Lean), we can't match on its constructors: we
+         test the discriminant field instead. See {!is_wide_enum}. *)
+      match (body, ty_as_wide_enum ctx scrut.ty) with
+      | Match branches, Some _ ->
+          extract_wide_enum_match span ctx fmt scrut branches
+      | _ -> extract_Switch span ctx fmt ~inside ~inside_do scrut body)
   | Meta (m, e) -> extract_meta span ctx fmt ~inside ~inside_do m e
   | StructUpdate supd -> extract_StructUpdate span ctx fmt ~inside supd e.ty
   | Loop _ ->
@@ -920,6 +978,20 @@ and extract_function_call (span : Meta.span) (ctx : extraction_ctx)
       extract_binop span ctx
         (extract_texpr span ctx fmt ~inside_do)
         fmt ~inside binop arg0 arg1
+  | Fun (Pure Discriminant), [ arg ]
+    when Option.is_some (ty_as_wide_enum ctx arg.ty) ->
+      (* The enumeration is extracted to a tagged structure (see
+         {!is_wide_enum}): its discriminant is the [disc] field, and there is no
+         [read_discriminant] instance for it (the [@[discriminant]] attribute
+         only applies to inductives).
+
+         Note that [ty_as_wide_enum] also checks that the backend is Lean. *)
+      if inside then F.pp_print_string fmt "(";
+      extract_texpr span ctx fmt
+        ~inside:(not (texpr_is_var arg))
+        ~inside_do:false arg;
+      F.pp_print_string fmt ".disc";
+      if inside then F.pp_print_string fmt ")"
   | Fun fun_id, _ ->
       let use_brackets = inside in
       if use_brackets then F.pp_print_string fmt "(";
@@ -1598,6 +1670,174 @@ and extract_Switch (span : Meta.span) (ctx : extraction_ctx) (fmt : F.formatter)
       | HOL4 -> F.pp_print_string fmt ")"));
   (* Close the box for the whole expression *)
   F.pp_close_box fmt ()
+
+(** Extract a match over an enumeration which is extracted to a tagged structure
+    rather than to an inductive (see {!is_wide_enum}).
+
+    The variants of such a type are not constructors anymore, so we can't match
+    on them: we test the [disc] field instead, and we project the payload
+    fields. We generate, for a match with branches [b0 .. bn]:
+
+    {[
+      (if x.disc = UScalar.ofNatCore 0 (by decide)
+       then <b0>
+       else if x.disc = UScalar.ofNatCore 1 (by decide)
+       then <b1>
+       else <bn>)
+    ]}
+
+    where [x] stands for the scrutinee, and where the payload of the variant of
+    a branch is bound at the beginning of the branch by projecting the
+    corresponding field:
+
+    {[
+      let (a0, a1) := Option.get! x.f0;
+    ]}
+
+    Remark: there is no [OfNat] instance for [U16], hence the use of
+    [UScalar.ofNatCore] (the proof obligation is discharged by [decide]: the
+    tags are smaller than the number of variants).
+
+    Remark: the projections are sound because a value of the structure is only
+    ever built through its constructors, and because a branch is only reached
+    when the tag matches - so the option we project is always inhabited. Lean
+    can't know that, though, and [Option.get] takes a proof that the option is
+    inhabited (which we can't provide), so we use [Option.get!] instead (which
+    requires the payload types to be inhabited). *)
+and extract_wide_enum_match (span : Meta.span) (ctx : extraction_ctx)
+    (fmt : F.formatter) (scrut : texpr) (branches : match_branch list) : unit =
+  (* The projected expression must be atomic: a projection binds stronger than
+     an application in Lean, so the scrutinee must be parenthesized whenever it
+     is not a variable.
+
+     Note that we print the scrutinee in front of every test: this is fine
+     because it is a pure expression (if it is not a variable, it is thus
+     evaluated again for each test, but this doesn't change the semantics). *)
+  let extract_scrut () : unit =
+    extract_texpr span ctx fmt
+      ~inside:(not (texpr_is_var scrut))
+      ~inside_do:false scrut
+  in
+  (* Print the test of a branch, i.e.
+     [<scrut>.disc = UScalar.ofNatCore <tag> (by decide)] *)
+  let extract_tag_test (tag : VariantId.id) : unit =
+    extract_scrut ();
+    F.pp_print_string fmt ".disc";
+    F.pp_print_space fmt ();
+    F.pp_print_string fmt "=";
+    F.pp_print_space fmt ();
+    F.pp_print_string fmt
+      ("UScalar.ofNatCore "
+      ^ string_of_int (VariantId.to_int tag)
+      ^ " (by decide)")
+  in
+  (* Print a branch: if it is a variant, we first bind the fields of the variant
+     (by projecting the [f<i>] field of the structure), then we print the branch
+     itself. A wildcard branch binds nothing. *)
+  let extract_branch (br : match_branch) : unit =
+    let binds_payload, ctx =
+      match br.pat.pat with
+      | PAdt { variant_id = Some tag; fields } ->
+          (* We introduce one binding per field of the variant. The fields are
+             stored as a (nested) tuple in the [f<i>] field, so the bindings share
+             a single let-binding which uses a tuple pattern.
+
+             A pattern can introduce new variables: we thus get an updated
+             context, which we use to print the branch. *)
+          let ctx, names =
+            List.fold_left_map
+              (fun ctx (f : tpat) ->
+                (* Note: we don't print the pattern of the field: we only
+                   register the name of the variable it introduces *)
+                match f.pat with
+                | POpen (v, _) ->
+                    let basename =
+                      ctx_compute_var_basename span ctx v.basename v.ty
+                    in
+                    let ctx, name = ctx_add_var span basename v.id ctx in
+                    (ctx, name)
+                | PIgnored -> (ctx, "_")
+                | PConstant _ | PBound _ | PAdt _ -> [%internal_error] span)
+              ctx fields
+          in
+          (* If all the fields are ignored, we don't need to project anything *)
+          let binds_payload = List.exists (fun name -> name <> "_") names in
+          if binds_payload then (
+            F.pp_print_string fmt "(";
+            F.pp_print_string fmt "let ";
+            F.pp_print_string fmt
+              (match names with
+              | [ name ] -> name
+              | _ -> "(" ^ String.concat ", " names ^ ")");
+            F.pp_print_string fmt " := Option.get! ";
+            extract_scrut ();
+            F.pp_print_string fmt
+              (".f" ^ string_of_int (VariantId.to_int tag) ^ ";");
+            F.pp_print_space fmt ());
+          (binds_payload, ctx)
+      | _ -> (false, ctx)
+    in
+    (* Print the branch itself.
+
+       The chain of tests is parenthesized, so a branch is in a term position:
+       we must thus not consider that we are inside a [do] block (a branch which
+       needs monadic statements is then wrapped in a [do] block by
+       {!extract_lets}). *)
+    F.pp_open_hovbox fmt ctx.indent_incr;
+    extract_texpr span ctx fmt ~inside:false ~inside_do:false br.branch;
+    F.pp_close_box fmt ();
+    (* Close the parenthesized let-binding *)
+    if binds_payload then F.pp_print_string fmt ")"
+  in
+  (* Print the chain of tests.
+
+     The last branch is the default branch of the chain: either it is a wildcard,
+     or the match is exhaustive (Rust matches over enumerations always are, and
+     those are the only matches over an enumeration we get here), in which case
+     its test is redundant. *)
+  F.pp_print_string fmt "(";
+  (* We use a vertical box: each test is thus printed on its own line *)
+  F.pp_open_vbox fmt 0;
+  let rec extract_chain (is_first : bool) (branches : match_branch list) : unit
+      =
+    match branches with
+    | [] -> [%internal_error] span
+    | [ br ] ->
+        (* Default branch *)
+        F.pp_print_space fmt ();
+        F.pp_open_hvbox fmt ctx.indent_incr;
+        F.pp_print_string fmt "else";
+        F.pp_print_space fmt ();
+        extract_branch br;
+        F.pp_close_box fmt ()
+    | br :: rest -> (
+        match br.pat.pat with
+        | PAdt { variant_id = Some tag; _ } ->
+            if is_first then F.pp_print_string fmt "if"
+            else (
+              F.pp_print_space fmt ();
+              F.pp_print_string fmt "else if");
+            F.pp_print_string fmt " ";
+            (* The enclosing box is vertical: we open a horizontal box around the
+               test to prevent it from being broken *)
+            F.pp_open_hovbox fmt 0;
+            extract_tag_test tag;
+            F.pp_close_box fmt ();
+            F.pp_print_space fmt ();
+            F.pp_open_hvbox fmt ctx.indent_incr;
+            F.pp_print_string fmt "then";
+            F.pp_print_space fmt ();
+            extract_branch br;
+            F.pp_close_box fmt ();
+            extract_chain false rest
+        | _ ->
+            (* A wildcard: the branches which follow it are unreachable, we
+               thus drop them *)
+            extract_branch br)
+  in
+  extract_chain true branches;
+  F.pp_close_box fmt ();
+  F.pp_print_string fmt ")"
 
 and extract_meta (span : Meta.span) (ctx : extraction_ctx) (fmt : F.formatter)
     ~(inside : bool) ~(inside_do : bool) (meta : emeta) (e : texpr) : unit =
