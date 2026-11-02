@@ -414,7 +414,27 @@ let analyze_full_ty (span : Meta.span option) (updated : bool ref)
         let ty_info = { ty_info with borrows_info } in
         (* For every instantiated type parameter: update the exploration info
            then explore the type *)
-        let params_tys = List.combine adt_info.param_infos generics.types in
+        (* [List.combine] raises [Invalid_argument] when a declaration's
+           parameters and this instantiation disagree in length, and that
+           aborted the whole crate (ferrosa_graph). Report the disagreement and
+           explore the parameters both sides agree on: the pass stays
+           conservative rather than dying. *)
+        let param_infos, param_tys =
+          if List.length adt_info.param_infos <> List.length generics.types
+          then begin
+            [%save_error_opt_span] span
+              (Printf.sprintf
+                 "Type declaration has %d type parameter(s) but is instantiated \
+                  with %d type argument(s); exploring the common prefix"
+                 (List.length adt_info.param_infos)
+                 (List.length generics.types));
+            let n = min (List.length adt_info.param_infos) (List.length generics.types) in
+            ( List.filteri (fun i _ -> i < n) adt_info.param_infos,
+              List.filteri (fun i _ -> i < n) generics.types )
+          end
+          else (adt_info.param_infos, generics.types)
+        in
+        let params_tys = List.combine param_infos param_tys in
         let ty_info =
           List.fold_left
             (fun ty_info (param_info, ty) ->
