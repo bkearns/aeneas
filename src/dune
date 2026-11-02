@@ -225,3 +225,13 @@
  (alias runtest)
  (action
   (run ./test_diagnose.exe)))
+
+(executable
+ (name test_trait_stub)
+ (modules Test_trait_stub)
+ (libraries aeneas))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_trait_stub.exe)))

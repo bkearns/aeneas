@@ -543,7 +543,14 @@ and extract_trait_decl_ref (span : Meta.span) (ctx : extraction_ctx)
   (* Lookup the information about the implicit/explicit parameters *)
   let explicit =
     match TraitDeclId.Map.find_opt tr.trait_decl_id ctx.trans_trait_decls with
-    | None -> (* The declaration might be missing if there was an error *) None
+    | None ->
+        (* A named trait outside the translation set still needs a declaration
+           for Lean to elaborate its uses. *)
+        if backend () = Lean then
+          ignore
+            (register_untranslated_trait ~name
+               ~arity:(List.length tr.decl_generics.types));
+        None
     | Some d -> Some d.explicit_info
   in
   (* There is something subtle here: the trait obligations for the implemented

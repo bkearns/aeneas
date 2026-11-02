@@ -1196,23 +1196,24 @@ let export_trait_impl (fmt : Format.formatter) (_config : gen_config)
     is precisely extracted. *)
 let extract_definitions (fmt : Format.formatter) (config : gen_config)
     (ctx : gen_ctx) : unit =
+  ExtractBase.reset_untranslated_traits ();
   (* Export the definition groups to the file, in the proper order.
      - [extract_decl]: extract the type declaration (if not filtered)
      - [extract_extra_info]: extra the extra type information (e.g.,
        the [Arguments] information in Coq).
   *)
-  let export_functions_group = export_functions_group fmt config ctx in
-  let export_global = export_global fmt config ctx in
-  let export_types_group = export_types_group fmt config ctx in
-  let export_trait_decl_group id =
-    export_trait_decl fmt config ctx id true false
-  in
-  let export_trait_decl_group_extra_info id =
-    export_trait_decl fmt config ctx id false true
-  in
-  let export_trait_impl ~is_rec = export_trait_impl fmt config ctx ~is_rec in
+  let print_decl_group (fmt : Format.formatter) (dg : declaration_group) : unit =
+    let export_functions_group = export_functions_group fmt config ctx in
+    let export_global = export_global fmt config ctx in
+    let export_types_group = export_types_group fmt config ctx in
+    let export_trait_decl_group id =
+      export_trait_decl fmt config ctx id true false
+    in
+    let export_trait_decl_group_extra_info id =
+      export_trait_decl fmt config ctx id false true
+    in
+    let export_trait_impl ~is_rec = export_trait_impl fmt config ctx ~is_rec in
 
-  let export_decl_group (dg : declaration_group) : unit =
     match dg with
     | TypeGroup (NonRecGroup id) ->
         if config.extract_types then export_types_group false [ id ]
@@ -1356,6 +1357,15 @@ let extract_definitions (fmt : Format.formatter) (config : gen_config)
     | MixedGroup _ ->
         [%craise_opt_span] None
           "Mixed-recursive declaration groups are not supported"
+  in
+  let export_decl_group (dg : declaration_group) : unit =
+    if Config.backend () = Lean then
+      ExtractBase.with_trait_stubs fmt (fun body_fmt ->
+          (* Match the file's outer vertical box while buffering the group. *)
+          Format.pp_open_vbox body_fmt 0;
+          print_decl_group body_fmt dg;
+          Format.pp_close_box body_fmt ())
+    else print_decl_group fmt dg
   in
 
   (* A trait declaration the crate carries but does not translate is in no declaration group, so it is

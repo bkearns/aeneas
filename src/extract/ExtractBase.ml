@@ -481,6 +481,51 @@ let names_maps_get (span : Meta.span option) (id_to_string : id -> string)
         | Lean -> "sorry /- " ^ err ^ "-/"
         | _ -> "(ERROR: " ^ id_to_string id ^ ")")
 
+(* Remember emitted names as well as pending ones so later uses cannot redeclare
+   the same trait after a flush. *)
+let untranslated_trait_names = ref StringSet.empty
+let untranslated_trait_decls = ref []
+
+let reset_untranslated_traits () : unit =
+  untranslated_trait_names := StringSet.empty;
+  untranslated_trait_decls := []
+
+let register_untranslated_trait ~(name : string) ~(arity : int) : bool =
+  if StringSet.mem name !untranslated_trait_names then false
+  else (
+    untranslated_trait_names := StringSet.add name !untranslated_trait_names;
+    untranslated_trait_decls := (name, arity) :: !untranslated_trait_decls;
+    true)
+
+let flush_untranslated_trait_decls (fmt : F.formatter) : unit =
+  List.iter
+    (fun (name, arity) ->
+      (* Keep the formatter synchronized with the surrounding declarations so
+         their separating breaks are preserved. *)
+      F.pp_open_hvbox fmt 0;
+      F.pp_print_string fmt ("structure " ^ name);
+      if arity > 0 then (
+        F.pp_print_string fmt " (Self : Type _)";
+        for _ = 2 to arity do
+          F.pp_print_string fmt " (_ : Type _)"
+        done);
+      F.pp_print_string fmt " where";
+      F.pp_close_box fmt ();
+      F.pp_print_break fmt 0 0)
+    (List.rev !untranslated_trait_decls);
+  untranslated_trait_decls := []
+
+let with_trait_stubs (fmt : F.formatter) (body : F.formatter -> unit) : unit =
+  let buf = Buffer.create 256 in
+  let body_fmt = F.formatter_of_buffer buf in
+  FormatCompat.use_byte_width body_fmt;
+  F.pp_set_geometry body_fmt ~max_indent:(F.pp_get_max_indent fmt ())
+    ~margin:(F.pp_get_margin fmt ());
+  body body_fmt;
+  F.pp_print_flush body_fmt ();
+  flush_untranslated_trait_decls fmt;
+  F.pp_print_string fmt (Buffer.contents buf)
+
 type names_map_init = {
   keywords : string list;
   builtin_adts : (builtin_ty * string) list;
