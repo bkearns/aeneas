@@ -295,7 +295,7 @@ let analyze_module (m : crate) (funs_map : fun_decl FunDeclId.Map.t) :
                declaration group:\n" ^ decls ^ "\n\nInitial error:\n"
             ^ error.msg));
         analyze_decl_groups decls'
-    | MixedGroup ids :: _ ->
+    | MixedGroup ids :: decls' ->
         [%save_error_opt_span] None
           ("Mixed declaration groups (which contain both type and function \
             declarations or functions and traits, for instance) are not \
@@ -303,7 +303,26 @@ let analyze_module (m : crate) (funs_map : fun_decl FunDeclId.Map.t) :
           ^ String.concat ", "
               (List.map Charon.Print.item_id_to_string
                  (Charon.GAstUtils.g_declaration_group_to_list ids))
-          ^ "]")
+          ^ "]");
+        (* The functions of a mixed group still need effect summaries, and so
+           does every function declared after it. Stopping the walk here left
+           all of them unanalysed, and each of their call sites then failed its
+           summary lookup with an anonymous internal error -- 1296 of them on a
+           single crate, from one mixed group. Analyse what is analysable and
+           carry on: a group we cannot model is not a reason to abandon the
+           rest of the module. *)
+        let funs =
+          List.filter_map
+            (fun id -> match id with Charon.Meta.IdFun id -> Some id | _ -> None)
+            (Charon.GAstUtils.g_declaration_group_to_list ids)
+        in
+        if funs <> [] then
+          (try analyze_fun_decl_group funs
+           with CFailure error ->
+             [%save_error_opt_span] error.span
+               ("Encountered an error when analyzing the functions of a mixed \
+                 declaration group:\n" ^ error.msg));
+        analyze_decl_groups decls'
   in
 
   analyze_decl_groups (Option.get m.declarations);
