@@ -54,3 +54,21 @@ let plan_of_group (members : member list) : plan =
   else
     Parameterized
       (List.map (fun (m : member) -> (m.name, dedup m.siblings)) members)
+
+(** The binder name used for a sister trait's dictionary type.
+
+    A trait's own name is a dotted Lean name, which is a valid *declaration* name
+    and an invalid *binder* name ("invalid binder name ..., it must be atomic"),
+    so it is carried into the binder list in guillemets. Guillemets also make the
+    mapping injective: a component containing an underscore and a component
+    separator both render as visible characters inside the same quoted
+    identifier, so two distinct trait names cannot collapse onto one binder -- a
+    collision Lean would report as a duplicate binder far from the cause. *)
+let binder_name (trait_ : string) : string = "«" ^ trait_ ^ "»"
+
+(** The full binder, including the universe the parameter has to live in.
+    A dictionary type whose fields quantify over [Type] inhabits [Type 1], so the
+    parameter is declared at [Type (u+1)]; [u] is declared once, at the top of the
+    emitted trait section. *)
+let binder_text (trait_ : string) : string =
+  "(" ^ binder_name trait_ ^ " : Type (u+1))"

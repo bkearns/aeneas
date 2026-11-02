@@ -108,5 +108,28 @@ let () =
       member "serde_core.ser.Error" [];
     ];
 
+  (* 7. A sister trait's dictionary type is carried as a binder. The trait's own
+        name is dotted, and Lean rejects a dotted binder, so the binder keeps the
+        name in guillemets. *)
+  check "binder keeps the trait name in guillemets"
+    (Trait_encoding.binder_name "serde_core.ser.Serializer"
+    = "«serde_core.ser.Serializer»")
+    (Trait_encoding.binder_name "serde_core.ser.Serializer");
+
+  (* 8. Two traits whose names differ only in how dots and underscores fall must
+        not collapse onto one binder: Lean would then report a duplicate binder
+        somewhere far from the cause. *)
+  check "distinct trait names stay distinct binders"
+    (Trait_encoding.binder_name "a.b_c" <> Trait_encoding.binder_name "a_b.c")
+    (Trait_encoding.binder_name "a.b_c" ^ " / " ^ Trait_encoding.binder_name "a_b.c");
+
+  (* 9. The binder has to be declared one universe up: a dictionary type whose
+        fields quantify over Type inhabits Type 1, and a parameter at Type would
+        reject the very dictionary the emitter passes to it. *)
+  check "binder is placed at Type (u+1)"
+    (Trait_encoding.binder_text "serde_core.ser.Serializer"
+    = "(«serde_core.ser.Serializer» : Type (u+1))")
+    (Trait_encoding.binder_text "serde_core.ser.Serializer");
+
   if !failures = 0 then print_endline "ALL PASS"
   else Printf.printf "%d FAILED\n" !failures
