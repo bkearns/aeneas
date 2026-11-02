@@ -758,11 +758,16 @@ and extract_trait_instance_id (span : Meta.span) (ctx : extraction_ctx)
 and extract_trait_clause_type (span : Meta.span) (ctx : extraction_ctx)
     (fmt : F.formatter) (no_params_tys : TypeDeclId.Set.t)
     (clause : trait_param) : unit =
-  let trait_name = ctx_get_trait_decl span clause.trait_id ctx in
-  F.pp_print_string fmt trait_name;
-  (* let span = (TraitDeclId.Map.find clause.trait_id ctx.trans_trait_decls).span in
-   *)
-  extract_generic_args span ctx fmt no_params_tys clause.generics
+  match Trait_encoding.binder_for clause.trait_id with
+  | Some binder ->
+      (* A sister of the declaration being printed, and a bound rather than a
+         type: the parameter stands for its dictionary type, so the arguments
+         that would have applied to the trait itself do not apply here. *)
+      F.pp_print_string fmt binder
+  | None ->
+      let trait_name = ctx_get_trait_decl span clause.trait_id ctx in
+      F.pp_print_string fmt trait_name;
+      extract_generic_args span ctx fmt no_params_tys clause.generics
 
 (** Compute the names for all the top-level identifiers used in a type
     definition (type name, variant names, field names, etc. but not type

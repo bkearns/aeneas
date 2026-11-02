@@ -132,6 +132,24 @@ let uniq (ids : Pure.trait_decl_id list) : Pure.trait_decl_id list =
 let traits_in_ty (t : Pure.ty) : Pure.trait_decl_id list =
   uniq (raw_traits_in_ty t)
 
+(** The traits a signature mentions: what it takes and what it returns, the
+    clauses it quantifies over ([fn ser<S: Serializer<...>>]), and the
+    constraints on its associated types. The clauses are the carrier that closes
+    serde's cycle: the field types mention nothing, yet the declaration cannot be
+    ordered against its sister. *)
+let traits_in_sig (s : Pure.fun_sig) : Pure.trait_decl_id list =
+  let from_types =
+    raw_traits_in_ty s.output @ List.concat_map raw_traits_in_ty s.inputs
+  in
+  let from_clauses = raw_traits_in_params s.generics in
+  let from_preds =
+    List.concat_map
+      (fun (c : Pure.trait_type_constraint) ->
+        raw_traits_in_ref c.trait_ref @ raw_traits_in_ty c.ty)
+      s.preds.trait_type_constraints
+  in
+  from_types @ from_clauses @ from_preds
+
 (** Every trait a declaration mentions anywhere: its methods' signatures, the
     clauses that make it a subtrait, and its associated constants' types.
     Associated types contribute on their own only through the generics of their
@@ -139,9 +157,7 @@ let traits_in_ty (t : Pure.ty) : Pure.trait_decl_id list =
 let traits_in_decl (d : Pure.trait_decl) : Pure.trait_decl_id list =
   let methods =
     List.concat_map
-      (fun (m : Pure.trait_method) ->
-        raw_traits_in_ty m.signature.output
-        @ List.concat_map raw_traits_in_ty m.signature.inputs)
+      (fun (m : Pure.trait_method) -> traits_in_sig m.signature)
       d.methods
   in
   let parent_clauses =

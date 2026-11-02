@@ -157,5 +157,53 @@ let () =
        (Trait_encoding.siblings_of ~this:"serde.Serializer" ~group
           [ "serde.Serializer"; "serde.SerializeSeq" ]));
 
+  (* A bound is not a type. [fn ser<S: Serializer<...>>] names its sister in the
+     signature's clauses, and that is what closes serde's cycle: the field type
+     mentions nothing, yet the declaration cannot be ordered. *)
+  let llbc_no_params : Charon.Types.generic_params =
+    {
+      regions = [];
+      types = [];
+      const_generics = [];
+      trait_clauses = [];
+      outlives = [];
+      trait_type_constraints = [];
+    }
+  in
+  let sig_ ?(clauses = []) ?(constraints = []) ?(inputs = []) ?(output = u8) () :
+      Pure.fun_sig =
+    {
+      generics = { no_params with trait_clauses = clauses };
+      explicit_info = { explicit_types = []; explicit_const_generics = [] };
+      known_from_trait_refs = { known_types = []; known_const_generics = [] };
+      llbc_generics = llbc_no_params;
+      preds = { trait_type_constraints = constraints };
+      fwd_info =
+        {
+          effect_info =
+            { can_fail = false; can_diverge = false; is_rec = false };
+          ignore_output = false;
+        };
+      back_effect_info = Pure.RegionGroupId.Map.empty;
+      inputs;
+      output;
+    }
+  in
+  let mentions s = Trait_encoding.traits_in_sig s in
+  check "a method's trait clause is a mention"
+    (mentions (sig_ ~clauses:[ clause 3 ] ()) = [ Pure.TraitDeclId.of_int 3 ])
+    (show_ids (mentions (sig_ ~clauses:[ clause 3 ] ())));
+  check "a signature's inputs and result are still mentions"
+    (mentions (sig_ ~inputs:[ trait_ty (tref 4) ] ~output:(trait_ty (tref 5)) ())
+    = [ Pure.TraitDeclId.of_int 5; Pure.TraitDeclId.of_int 4 ])
+    (show_ids
+       (mentions (sig_ ~inputs:[ trait_ty (tref 4) ] ~output:(trait_ty (tref 5)) ())));
+  let constraint_ : Pure.trait_type_constraint =
+    { trait_ref = tref 6; type_id = Charon.Types.AssocTypeId.of_int 0; ty = u8 }
+  in
+  check "an associated-type constraint is a mention"
+    (mentions (sig_ ~constraints:[ constraint_ ] ()) = [ Pure.TraitDeclId.of_int 6 ])
+    (show_ids (mentions (sig_ ~constraints:[ constraint_ ] ())));
+
   if !failures = 0 then print_endline "ALL PASS"
   else Printf.printf "%d FAILED\n" !failures
