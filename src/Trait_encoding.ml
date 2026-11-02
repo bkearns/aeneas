@@ -69,9 +69,170 @@ let binder_name (trait_ : string) : string = "«" ^ trait_ ^ "»"
 (** The full binder, including the universe the parameter has to live in.
     A dictionary type whose fields quantify over [Type] inhabits [Type 1], so the
     parameter is declared at [Type (u+1)]; [u] is declared once, at the top of the
-    emitted trait section. *)
+    emitted trait section.
+
+    The binder carries a default because the parameter is not always
+    recoverable at the use site. A dictionary type is a Rust where-clause in
+    disguise: [Deserialize V] can only be completed by the [Deserializer] the
+    surrounding declaration works with, and when nothing in scope names one
+    there is no honest argument to print. A default turns that into one hole
+    at the declaration instead of a partially applied type former at every use
+    -- and a hole is visible in the file, whereas a made-up dictionary type
+    would type-check and lie about what the model says. Sites where the clauses
+    do supply the whole dictionary still get it, through {!arguments_of}, but on
+    a serde-sized crate almost none do: a declaration binds the clauses its own
+    signature needs, not the whole group's. *)
 let binder_text (trait_ : string) : string =
+  "(" ^ binder_name trait_ ^ " : Type (u+1) := sorry)"
+
+(** The same parameter spelled as the *type* it stands for, for naming it where
+    a value is expected rather than declaring it.
+
+    An ascription cannot carry a default, so this cannot be [binder_text]: the
+    two denote one type and have to be written differently, and using the
+    declarative spelling inside a method's binder is a syntax error far from the
+    cause. *)
+let binder_ref (trait_ : string) : string =
   "(" ^ binder_name trait_ ^ " : Type (u+1))"
+
+(** A sister trait that a declaration of a parameterized group takes as a
+    parameter, with the Lean name an argument can be written against.
+
+    The plan below says which parameters a declaration carries; a use site
+    needs the other half, the *argument*. It cannot be recovered from the use
+    site: [Deserialize V] says nothing about which [Deserializer] the
+    surrounding declaration works with. So the name is recorded where the group
+    was decided and looked up again by id. *)
+type extra_param = { sister_id : Pure.trait_decl_id; sister_name : string }
+
+(** A dictionary type as it can be written at one use site: the sister, the
+    arguments the clause binds it to, and -- because that dictionary's own
+    parameters ask for dictionaries in turn -- the arguments *those* need. *)
+type argument = {
+  arg_param : extra_param;
+  arg_clause : Pure.trait_param;
+  arg_nested : argument list;
+}
+
+(** Build the arguments a use site can write, out of the clauses it has.
+
+    All or nothing, and that is the whole point. A dictionary type is written
+    [Sister T1 .. Tn], so naming it means naming the dictionaries its *own*
+    parameters ask for -- [Serialize] takes [Serializer]'s, which takes the
+    eight [Serialize*] traits', which take [Serialize]'s again. Half a term is
+    not a type: leaving the tail to the parameter defaults would put a hole
+    inside an argument rather than at the end of the argument list, where it
+    could not even be seen. So the answer is [None] unless every level can be
+    written, and the caller reports the gap instead.
+
+    [visited] is the chain already being written, and it is not an optimisation.
+    Dependencies inside a group are cyclic, so an unguarded walk would never
+    terminate; a repeat means the term would be infinite, which is to say:
+    unwritable.
+
+    [params_of] is the parameter list of a declaration. It is passed in rather
+    than read from the table so the decision can be tested on its own. *)
+let rec arguments_of ~(clauses : Pure.trait_param list)
+    ~(params_of : Pure.trait_decl_id -> extra_param list)
+    ~(visited : Pure.trait_decl_id list) (params : extra_param list) :
+    argument list option =
+  match params with
+  | [] -> Some []
+  | p :: rest -> (
+      let bound =
+        List.find_opt
+          (fun (c : Pure.trait_param) -> c.trait_id = p.sister_id)
+          clauses
+      in
+      match bound with
+      | Some arg_clause
+        when not (List.exists (fun id -> id = p.sister_id) visited) -> (
+          match
+            arguments_of ~clauses ~params_of
+              ~visited:(p.sister_id :: visited)
+              (params_of p.sister_id)
+          with
+          | None -> None
+          | Some arg_nested -> (
+              match arguments_of ~clauses ~params_of ~visited rest with
+              | None -> None
+              | Some rest ->
+                  Some ({ arg_param = p; arg_clause; arg_nested } :: rest)))
+      | _ -> None)
+
+(** Per-declaration parameters, filled once per file before anything is printed.
+
+    A group's plan is decided at the group, but its use sites are printed
+    wherever they occur -- an impl of the trait, a function that takes it as a
+    clause, a field of an unrelated type -- and [split-files] prints use sites in
+    a file that does not print the declarations at all. A table keyed by
+    declaration id is therefore the only place where the arity is visible at
+    both ends. It is rebuilt from the crate's declaration groups at the start of
+    every file, so a second crate extracted in the same run cannot inherit the
+    first one's ids. *)
+let parameterized : (string, extra_param list) Hashtbl.t = Hashtbl.create 16
+
+let reset_parameterized () : unit = Hashtbl.reset parameterized
+
+let register_parameterized ~(id : Pure.trait_decl_id)
+    (params : extra_param list) : unit =
+  Hashtbl.replace parameterized (Pure.TraitDeclId.to_string id) params
+
+(** The extra parameters a declaration carries, in binder order. Empty for the
+    overwhelming majority of traits, which no group makes cyclic. *)
+let extra_params (id : Pure.trait_decl_id) : extra_param list =
+  Option.value
+    ~default:[]
+    (Hashtbl.find_opt parameterized (Pure.TraitDeclId.to_string id))
+
+(** The trait clauses of the declaration being printed.
+
+    A use site can only be completed from what that declaration binds: a clause
+    is the only place where a dictionary type is named with the arguments its
+    methods need, and the surrounding function's own parameters are the only
+    names a term may mention. *)
+
+let current_clauses : (string, Pure.trait_param) Hashtbl.t = Hashtbl.create 16
+
+let current_owner : string ref = ref ""
+
+let current_clauses_list () : Pure.trait_param list =
+  Hashtbl.fold (fun _ c acc -> c :: acc) current_clauses []
+
+(** Install the clauses in force while [f] prints one declaration.
+
+    [owner] names the declaration, for the report emitted when a parameter
+    cannot be supplied -- a bare span does not say which of two hundred
+    functions the reader should look at. *)
+let with_clauses ~(owner : string) ~(clauses : Pure.trait_param list)
+    (f : unit -> unit) : unit =
+  let saved = Hashtbl.copy current_clauses in
+  let saved_owner = !current_owner in
+  Hashtbl.reset current_clauses;
+  (* First clause wins: two clauses on one trait are two dictionaries, and either
+     names types the declaration may use, so picking one is enough and picking
+     the same one every run keeps the output stable. *)
+  List.iter
+    (fun (c : Pure.trait_param) ->
+      let key = Pure.TraitDeclId.to_string c.trait_id in
+      if not (Hashtbl.mem current_clauses key) then
+        Hashtbl.add current_clauses key c)
+    clauses;
+  current_owner := owner;
+  Fun.protect f ~finally:(fun () ->
+      Hashtbl.reset current_clauses;
+      Hashtbl.iter (fun k v -> Hashtbl.replace current_clauses k v) saved;
+      current_owner := saved_owner)
+
+(** The declaration whose clauses are in force, for error messages: a span alone
+    does not say which of two hundred functions the reader should look at. *)
+let owner () : string = !current_owner
+
+(** {!arguments_of} against the scope in force: the arguments this use site can
+    carry, or [None] when it can carry none of them. *)
+let arguments_here (id : Pure.trait_decl_id) : argument list option =
+  arguments_of ~clauses:(current_clauses_list ()) ~params_of:extra_params
+    ~visited:[] (extra_params id)
 
 (** Which traits a type mentions.
 

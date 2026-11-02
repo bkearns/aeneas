@@ -2098,7 +2098,7 @@ let extract_fun_comment (ctx : extraction_ctx) (fmt : F.formatter)
     exception** of opaque (builtin/declared) functions for HOL4.
 
     See {!extract_fun_decl}. *)
-let extract_fun_decl_gen (ctx : extraction_ctx) (fmt : F.formatter)
+let extract_fun_decl_gen_raw (ctx : extraction_ctx) (fmt : F.formatter)
     (kind : decl_kind) (has_decreases_clause : bool) (def : fun_decl) : unit =
   [%sanity_check] def.item_meta.span (not def.is_global_decl_body);
   (* Retrieve the function name *)
@@ -2483,7 +2483,15 @@ let extract_fun_decl (ctx : extraction_ctx) (fmt : F.formatter)
   (* We treat HOL4 opaque functions in a specific manner *)
   if backend () = HOL4 && Option.is_none def.body then
     extract_fun_decl_hol4_opaque ctx fmt def
-  else extract_fun_decl_gen ctx fmt kind has_decreases_clause def
+  else
+    (* A signature's clauses are the dictionaries a use of a cyclic group's trait
+       can name: the declaration is where a where-clause lives, and the
+       translator has already turned [D: Deserializer<'de>] into a bound. *)
+    Trait_encoding.with_clauses
+      ~owner:
+        (ctx_get_local_function def.item_meta.span def.def_id def.loop_id ctx)
+      ~clauses:def.signature.generics.trait_clauses (fun () ->
+        extract_fun_decl_gen_raw ctx fmt kind has_decreases_clause def)
 
 (** Extract a global declaration body of the shape "QUALIF NAME : TYPE = BODY"
     with a custom body extractor.
@@ -3111,13 +3119,20 @@ let extract_trait_decl_method_items_aux (ctx : extraction_ctx)
 
 let extract_trait_decl_method_items (ctx : extraction_ctx) (fmt : F.formatter)
     (decl : trait_decl) (meth : trait_method) : unit =
-  try extract_trait_decl_method_items_aux ctx fmt decl meth
+  (* The method's own clause is what tells a use of a sister trait which
+     dictionary it means, so it has to be in scope while the signature prints. *)
+  try
+    Trait_encoding.with_clauses
+      ~owner:(ctx_get_trait_method meth.item_meta.span decl.def_id meth.method_id ctx)
+      ~clauses:
+        (decl.parent_clauses @ meth.signature.generics.trait_clauses)
+      (fun () -> extract_trait_decl_method_items_aux ctx fmt decl meth)
   with CFailure _ ->
     F.pp_print_space fmt ();
     extract_admit fmt
 
-(** Extract a trait declaration *)
-let extract_trait_decl (ctx : extraction_ctx) (fmt : F.formatter)
+(** Extract a trait declaration, with the declaration's own clauses in scope. *)
+let extract_trait_decl_gen (ctx : extraction_ctx) (fmt : F.formatter)
     (decl : trait_decl) : unit =
   (* Retrieve the trait name *)
   let decl_name = ctx_get_trait_decl decl.item_meta.span decl.def_id ctx in
@@ -3347,6 +3362,19 @@ let extract_trait_decl (ctx : extraction_ctx) (fmt : F.formatter)
   (* Add breaks to insert new lines between definitions *)
   F.pp_print_break fmt 0 0
 
+(** Extract a trait declaration.
+
+    The declaration's own clauses -- its supertraits -- are what its method
+    signatures may name as dictionaries, so they go in scope for the whole
+    declaration. A method adds its own clauses on top for the duration of one
+    field; see {!extract_trait_decl_method_items}. *)
+let extract_trait_decl (ctx : extraction_ctx) (fmt : F.formatter)
+    (decl : trait_decl) : unit =
+  Trait_encoding.with_clauses
+    ~owner:(ctx_get_trait_decl decl.item_meta.span decl.def_id ctx)
+    ~clauses:decl.parent_clauses
+    (fun () -> extract_trait_decl_gen ctx fmt decl)
+
 (** Generate the [Arguments] instructions for the trait declarationsin Coq, so
     that we don't have to provide the implicit arguments when projecting the
     fields. *)
@@ -3496,8 +3524,8 @@ let extract_trait_impl_method_items (ctx : extraction_ctx) (fmt : F.formatter)
        F.pp_print_space fmt ();
        extract_admit fmt)
 
-(** Extract a trait implementation *)
-let extract_trait_impl (ctx : extraction_ctx) (fmt : F.formatter)
+(** Generate the body of a trait implementation. *)
+let extract_trait_impl_gen (ctx : extraction_ctx) (fmt : F.formatter)
     ~(is_rec : bool) (impl : trait_impl) : unit =
   [%ltrace name_to_string ctx impl.item_meta.name];
   let span = impl.item_meta.span in
@@ -3754,6 +3782,18 @@ let extract_trait_impl (ctx : extraction_ctx) (fmt : F.formatter)
   F.pp_close_box fmt ();
   (* Add breaks to insert new lines between definitions *)
   F.pp_print_break fmt 0 0
+
+(** Extract a trait implementation.
+
+    [impl<T: Serialize> Trait for Foo<T>] binds its where-clauses, and those are
+    the only dictionaries a use of a cyclic group's trait inside the impl -- in
+    its type, in its method signatures -- can name. *)
+let extract_trait_impl (ctx : extraction_ctx) (fmt : F.formatter)
+    ~(is_rec : bool) (impl : trait_impl) : unit =
+  Trait_encoding.with_clauses
+    ~owner:(ctx_get_trait_impl impl.item_meta.span impl.def_id ctx)
+    ~clauses:impl.generics.trait_clauses (fun () ->
+      extract_trait_impl_gen ctx fmt ~is_rec impl)
 
 (** Extract a unit test, if the function is a unit function (takes no
     parameters, returns unit).

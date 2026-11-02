@@ -1197,6 +1197,77 @@ let export_trait_impl (fmt : Format.formatter) (_config : gen_config)
 let extract_definitions (fmt : Format.formatter) (config : gen_config)
     (ctx : gen_ctx) : unit =
   ExtractBase.reset_untranslated_traits ();
+  (* The Lean name a trait declaration got, if it was translated at all. *)
+  let trait_name_of (id : Pure.trait_decl_id) : string option =
+    match TraitDeclId.Map.find_opt id ctx.trans_trait_decls with
+    | None -> None
+    | Some d ->
+        Some (ExtractBase.ctx_get_trait_decl d.item_meta.span d.def_id ctx)
+  in
+  (* The shape of one trait-declaration group: whether its members have to name
+     each other through parameters at all, and if so which parameter each of
+     them carries. See {!Trait_encoding}. *)
+  let group_plan (ids : TraitDeclId.id list) : Trait_encoding.plan =
+    if Config.backend () <> Lean then Trait_encoding.Plain
+    else
+      let group_names = List.filter_map trait_name_of ids in
+      let members =
+        List.filter_map
+          (fun id ->
+            match TraitDeclId.Map.find_opt id ctx.trans_trait_decls with
+            | None -> None
+            | Some d ->
+                Some
+                  (Trait_encoding.member_of_decl
+                     ~this:
+                       (ExtractBase.ctx_get_trait_decl d.item_meta.span
+                          d.def_id ctx)
+                     ~group:group_names ~name_of:trait_name_of d))
+          ids
+      in
+      Trait_encoding.plan_of_group members
+  in
+  (* The extra parameters of one member, paired with the id a use site looks them
+     up by. The analysis yields Lean names -- those are what the printer prints
+     and what the plan is keyed on -- while a use site only has the id, so the
+     two are joined here, once, rather than at every printing. *)
+  let extra_params_of_member ~(ids : TraitDeclId.id list)
+      ~(plan : Trait_encoding.plan) (id : Pure.trait_decl_id) :
+      Trait_encoding.extra_param list =
+    match plan with
+    | Trait_encoding.Plain -> []
+    | Trait_encoding.Parameterized members ->
+        let sisters =
+          match trait_name_of id with
+          | None -> []
+          | Some this -> Option.value (List.assoc_opt this members) ~default:[]
+        in
+        List.filter_map
+          (fun name ->
+            Option.map
+              (fun sister_id ->
+                Trait_encoding.{ sister_id; sister_name = name })
+              (List.find_opt (fun i -> trait_name_of i = Some name) ids))
+          sisters
+  in
+  (* Decide every group before printing anything. A use site is printed wherever
+     it occurs -- an impl of the trait, a function that takes it as a clause, a
+     field of an unrelated type -- and with [split-files] it is printed in a file
+     that does not print the declarations, so the arity cannot be recovered at
+     the use site and has to be sitting in the table by then. *)
+  Trait_encoding.reset_parameterized ();
+  List.iter
+    (fun (dg : declaration_group) ->
+      match dg with
+      | TraitDeclGroup (RecGroup ids) ->
+          let plan = group_plan ids in
+          List.iter
+            (fun id ->
+              Trait_encoding.register_parameterized ~id
+                (extra_params_of_member ~ids ~plan id))
+            ids
+      | _ -> ())
+    (Option.get ctx.crate.declarations);
   (* Export the definition groups to the file, in the proper order.
      - [extract_decl]: extract the type declaration (if not filtered)
      - [extract_extra_info]: extra the extra type information (e.g.,
@@ -1297,64 +1368,26 @@ let extract_definitions (fmt : Format.formatter) (config : gen_config)
                it is genuinely cyclic, emit each trait as an ordinary structure that
                takes its sisters' dictionary types as parameters instead of naming
                them. See {!Trait_encoding}. *)
-            let group_names =
-              List.filter_map
-                (fun id ->
-                  match TraitDeclId.Map.find_opt id ctx.trans_trait_decls with
-                  | None -> None
-                  | Some d -> Some (ExtractBase.ctx_get_trait_decl d.item_meta.span d.def_id ctx))
-                ids
-            in
-            let name_of id =
-              match TraitDeclId.Map.find_opt id ctx.trans_trait_decls with
-              | None -> None
-              | Some d -> Some (ExtractBase.ctx_get_trait_decl d.item_meta.span d.def_id ctx)
-            in
-            let plan =
-              if Config.backend () <> Lean then Trait_encoding.Plain
-              else
-                let members =
-                  List.filter_map
-                    (fun id ->
-                      match TraitDeclId.Map.find_opt id ctx.trans_trait_decls with
-                      | None -> None
-                      | Some d ->
-                          Some
-                            (Trait_encoding.member_of_decl
-                               ~this:(ExtractBase.ctx_get_trait_decl d.item_meta.span d.def_id ctx)
-                               ~group:group_names ~name_of d))
-                    ids
-                in
-                Trait_encoding.plan_of_group members
-            in
+            let plan = group_plan ids in
             let print_decl id =
               match plan with
               | Trait_encoding.Plain -> export_trait_decl_group id
-              | Trait_encoding.Parameterized members -> (
-                  match TraitDeclId.Map.find_opt id ctx.trans_trait_decls with
-                  | None -> export_trait_decl_group id
-                  | Some d ->
-                      let this = ExtractBase.ctx_get_trait_decl d.item_meta.span d.def_id ctx in
-                      (* Only the sisters this declaration actually names become
-                         parameters: the rest would be parameters nothing uses. *)
-                      let sibling_names =
-                        Option.value (List.assoc_opt this members) ~default:[]
-                      in
-                      let id_of_name n =
-                        List.find_opt (fun id -> name_of id = Some n) ids
-                      in
-                      let pairs =
-                        List.filter_map
-                          (fun n ->
-                            Option.map
-                              (fun id -> (id, Trait_encoding.binder_text n))
-                              (id_of_name n))
-                          sibling_names
-                      in
-                      Trait_encoding.with_binders
-                        ~header:(List.map snd pairs)
-                        ~siblings:pairs
-                        (fun () -> export_trait_decl_group id))
+              | Trait_encoding.Parameterized _ ->
+                  let params = extra_params_of_member ~ids ~plan id in
+                  (* Only the sisters this declaration actually names become
+                     parameters: the rest would be parameters nothing uses. *)
+                  Trait_encoding.with_binders
+                    ~header:
+                      (List.map
+                         (fun (p : Trait_encoding.extra_param) ->
+                           Trait_encoding.binder_text p.sister_name)
+                         params)
+                    ~siblings:
+                      (List.map
+                         (fun (p : Trait_encoding.extra_param) ->
+                           (p.sister_id, Trait_encoding.binder_ref p.sister_name))
+                         params)
+                    (fun () -> export_trait_decl_group id)
             in
             if plan = Trait_encoding.Plain && Config.backend () = Lean then (
               Format.pp_print_string fmt "mutual";

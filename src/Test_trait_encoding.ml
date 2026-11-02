@@ -125,11 +125,82 @@ let () =
 
   (* 9. The binder has to be declared one universe up: a dictionary type whose
         fields quantify over Type inhabits Type 1, and a parameter at Type would
-        reject the very dictionary the emitter passes to it. *)
-  check "binder is placed at Type (u+1)"
+        reject the very dictionary the emitter passes to it. It also carries a
+        default, so a use site that cannot name a dictionary leaves a visible
+        hole in the parameter instead of a partially applied type former. *)
+  check "binder is placed at Type (u+1) and defaults to a hole"
     (Trait_encoding.binder_text "serde_core.ser.Serializer"
-    = "(«serde_core.ser.Serializer» : Type (u+1))")
+    = "(«serde_core.ser.Serializer» : Type (u+1) := sorry)")
     (Trait_encoding.binder_text "serde_core.ser.Serializer");
+
+  (* 10. The same parameter has two spellings, and they cannot be one string: a
+        default is binder syntax, and the printers also need to *name* the type
+        the parameter stands for (a method's [SerializerInst] binder is typed by
+        it). An ascription with a default is a syntax error, and it fails far
+        from the cause. *)
+  check "the parameter is also spellable as a type"
+    (Trait_encoding.binder_ref "serde_core.ser.Serializer"
+    = "(«serde_core.ser.Serializer» : Type (u+1))")
+    (Trait_encoding.binder_ref "serde_core.ser.Serializer");
+
+  (* 11. Supplying the arguments. A sister's dictionary is a where-clause in
+         disguise, so the clauses in scope decide how much of it can be written:
+         the sister's name, the arguments its clause binds it to, and what the
+         parameters of *that* dictionary ask for in turn. *)
+  let sister id name =
+    Trait_encoding.{ sister_id = Pure.TraitDeclId.of_int id; sister_name = name }
+  in
+  let bind (id : int) : Pure.trait_param =
+    {
+      clause_id = Charon.Types.TraitClauseId.of_int id;
+      trait_id = Pure.TraitDeclId.of_int id;
+      generics = { types = []; const_generics = []; trait_refs = [] };
+    }
+  in
+  (* A -> B -> C closes, D <-> E does not. A table rather than the global store,
+     so the recursion is decided by the fixtures and the cases read as a chain. *)
+  let table =
+    [
+      (1, [ sister 2 "B" ]);
+      (2, [ sister 3 "C" ]);
+      (3, []);
+      (4, [ sister 5 "E" ]);
+      (5, [ sister 4 "D" ]);
+    ]
+  in
+  let params_of id =
+    Option.value (List.assoc_opt (Pure.TraitDeclId.to_int id) table) ~default:[]
+  in
+  (* The shape as a string, one level per dictionary, so a case states exactly
+     how deep the chain was written and where it stopped. *)
+  let rec show (args : Trait_encoding.argument list) : string =
+    "[" ^ String.concat "; "
+            (List.map
+               (fun (a : Trait_encoding.argument) ->
+                 a.arg_param.sister_name ^ ("(" ^ show a.arg_nested ^ ")"))
+               args)
+    ^ "]"
+  in
+  let case what expected clauses id =
+    let got =
+      Trait_encoding.arguments_of ~clauses ~params_of ~visited:[]
+        (params_of (Pure.TraitDeclId.of_int id))
+      |> Option.map show |> Option.value ~default:"none"
+    in
+    check what (got = expected) got
+  in
+  case "a bound sister is written with its clause's arguments" "[C([])]"
+    [ bind 3 ] 2;
+  case "an unbound sister is not written at all" "none" [ bind 2 ] 2;
+  (* The chain goes one level deeper than the clause: the sister's own
+     dictionaries must be bound too, or the term would stop half-written, with
+     the hole hidden inside an argument instead of at the end of the list. *)
+  case "a chain that stops is not written" "none" [ bind 1; bind 2 ] 1;
+  case "a chain that closes is written" "[B([C([])])]"
+    [ bind 1; bind 2; bind 3 ] 1;
+  (* A cycle cannot be written out, so the walk stops at the repeat instead of
+     running forever: serde's group really is cyclic. *)
+  case "a cycle is not written" "none" [ bind 4; bind 5 ] 4;
 
   if !failures = 0 then print_endline "ALL PASS"
   else Printf.printf "%d FAILED\n" !failures

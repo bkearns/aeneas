@@ -564,6 +564,10 @@ and extract_trait_decl_ref (span : Meta.span) (ctx : extraction_ctx)
      trait are put inside the parent clauses, so we must ignore them here *)
   let generics = { tr.decl_generics with trait_refs = [] } in
   extract_generic_args span ctx fmt no_params_tys ~explicit generics;
+  (* A cyclic group makes each of its members take its sisters' dictionary types
+     as parameters; a use site has to pass them or it names a partially applied
+     type former. *)
+  extract_trait_extra_params span ctx fmt no_params_tys tr.trait_decl_id;
   if use_brackets then F.pp_print_string fmt ")"
 
 and extract_generic_args (span : Meta.span) (ctx : extraction_ctx)
@@ -601,6 +605,68 @@ and extract_generic_args (span : Meta.span) (ctx : extraction_ctx)
     Collections.List.iter_link (F.pp_print_space fmt)
       (extract_trait_ref span ctx fmt no_params_tys ~inside:true)
       trait_refs)
+
+(** Print the arguments a use of a parameterized trait has to carry.
+
+    Every member of a cyclic group takes its sisters' dictionary types as
+    parameters, so printing the trait without them leaves a partially applied
+    type former where Lean expects a type. Inside the group the printer
+    substituted a *parameter* for such a sister, and that parameter already
+    stands for the whole dictionary type -- this is the outside: an impl's type,
+    a function's binder, a field of an unrelated structure.
+
+    The dictionary is a Rust where-clause in disguise: [Deserialize V] is only
+    complete once the enclosing declaration's [D: Deserializer] says which
+    deserializer the term is about. {!Trait_encoding.arguments_here} writes that
+    term out of the clauses in scope, and nothing at all when they cannot supply
+    it whole -- the parameter's default is then a hole, which is reported here
+    rather than papered over with a plausible type. Nothing in scope naming the
+    dictionary is the common case, not the exception: a declaration binds the
+    clauses its own signature needs, not the whole group's. *)
+and extract_trait_extra_params (span : Meta.span) (ctx : extraction_ctx)
+    (fmt : F.formatter) (no_params_tys : TypeDeclId.Set.t)
+    (id : Pure.trait_decl_id) : unit =
+  let rec print (args : Trait_encoding.argument list) : unit =
+    List.iter
+      (fun (a : Trait_encoding.argument) ->
+        let p = a.arg_param in
+        F.pp_print_space fmt ();
+        (* Lean applications are juxtaposition, so an argument that is itself an
+           application has to be parenthesised or its own arguments are read as
+           further arguments of the trait -- [Deserialize T Deserializer D E] is
+           four arguments to a two-parameter structure, not [Deserialize T
+           (Deserializer D E)]. *)
+        let bracketed = a.arg_clause.generics <> empty_generic_args in
+        if bracketed then F.pp_print_string fmt "(";
+        F.pp_print_string fmt p.sister_name;
+        (* The clause's generics are the *applied* arguments, so they filter
+           through the sister's explicit information exactly like a trait
+           reference's own arguments do. *)
+        let explicit =
+          match TraitDeclId.Map.find_opt p.sister_id ctx.trans_trait_decls with
+          | None -> None
+          | Some d -> Some d.explicit_info
+        in
+        let generics = { a.arg_clause.generics with trait_refs = [] } in
+        extract_generic_args span ctx fmt no_params_tys ~explicit generics;
+        print a.arg_nested;
+        if bracketed then F.pp_print_string fmt ")")
+      args
+  in
+  match Trait_encoding.arguments_here id with
+  | Some args -> print args
+  | None ->
+      (* One report per use site, however many parameters it costs: they are all
+         missing for the same reason, and a hole among them would shift every
+         later argument out of its slot. *)
+      [%save_error] span
+        (Printf.sprintf
+           "the Lean model of '%s' takes its sisters' dictionary types as \
+            parameters, and the clauses in scope of '%s' do not provide them \
+            all; they are left as holes"
+           (ctx_get_trait_decl span id ctx)
+           (let owner = Trait_encoding.owner () in
+            if owner = "" then "the declaration being printed" else owner))
 
 (** We sometimes need to ignore references to `Self` when generating the code,
     espcially when we project associated items. For this reason we have a
@@ -767,7 +833,10 @@ and extract_trait_clause_type (span : Meta.span) (ctx : extraction_ctx)
   | None ->
       let trait_name = ctx_get_trait_decl span clause.trait_id ctx in
       F.pp_print_string fmt trait_name;
-      extract_generic_args span ctx fmt no_params_tys clause.generics
+      extract_generic_args span ctx fmt no_params_tys clause.generics;
+      (* A bound, like a type, has to carry the sister parameters of the trait it
+         is a bound on. *)
+      extract_trait_extra_params span ctx fmt no_params_tys clause.trait_id
 
 (** Compute the names for all the top-level identifiers used in a type
     definition (type name, variant names, field names, etc. but not type
