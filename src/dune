@@ -123,6 +123,7 @@
   SynthesizeSymbolic
   TranslateCore
   Translate
+  Trait_encoding
   TypesAnalysis
   Types
   TypesUtils
@@ -235,3 +236,13 @@
  (alias runtest)
  (action
   (run ./test_trait_stub.exe)))
+
+(executable
+ (name test_trait_encoding)
+ (modules Test_trait_encoding)
+ (libraries aeneas))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_trait_encoding.exe)))
