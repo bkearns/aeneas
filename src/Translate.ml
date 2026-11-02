@@ -1290,14 +1290,77 @@ let extract_definitions (fmt : Format.formatter) (config : gen_config)
                ^ String.concat "\n" decls);
             (* We still extract something so that the user can look at it and
              eventually fix it *)
-            (* Lean has no forward references, so a group whose declarations mention each other
-               only elaborates inside a [mutual] block, where each may refer to the others. *)
-            let mutual = Config.backend () = Lean in
-            if mutual then (
+            (* Lean has no forward references, so a group whose declarations mention
+               each other can only name each other inside a [mutual] block -- but a
+               block requires every member to share one parameter list, and Rust
+               does not constrain that. So: decide the group's shape first, and when
+               it is genuinely cyclic, emit each trait as an ordinary structure that
+               takes its sisters' dictionary types as parameters instead of naming
+               them. See {!Trait_encoding}. *)
+            let group_names =
+              List.filter_map
+                (fun id ->
+                  match TraitDeclId.Map.find_opt id ctx.trans_trait_decls with
+                  | None -> None
+                  | Some d -> Some (ExtractBase.ctx_get_trait_decl d.item_meta.span d.def_id ctx))
+                ids
+            in
+            let name_of id =
+              match TraitDeclId.Map.find_opt id ctx.trans_trait_decls with
+              | None -> None
+              | Some d -> Some (ExtractBase.ctx_get_trait_decl d.item_meta.span d.def_id ctx)
+            in
+            let plan =
+              if Config.backend () <> Lean then Trait_encoding.Plain
+              else
+                let members =
+                  List.filter_map
+                    (fun id ->
+                      match TraitDeclId.Map.find_opt id ctx.trans_trait_decls with
+                      | None -> None
+                      | Some d ->
+                          Some
+                            (Trait_encoding.member_of_decl
+                               ~this:(ExtractBase.ctx_get_trait_decl d.item_meta.span d.def_id ctx)
+                               ~group:group_names ~name_of d))
+                    ids
+                in
+                Trait_encoding.plan_of_group members
+            in
+            let print_decl id =
+              match plan with
+              | Trait_encoding.Plain -> export_trait_decl_group id
+              | Trait_encoding.Parameterized members -> (
+                  match TraitDeclId.Map.find_opt id ctx.trans_trait_decls with
+                  | None -> export_trait_decl_group id
+                  | Some d ->
+                      let this = ExtractBase.ctx_get_trait_decl d.item_meta.span d.def_id ctx in
+                      (* Only the sisters this declaration actually names become
+                         parameters: the rest would be parameters nothing uses. *)
+                      let sibling_names =
+                        Option.value (List.assoc_opt this members) ~default:[]
+                      in
+                      let id_of_name n =
+                        List.find_opt (fun id -> name_of id = Some n) ids
+                      in
+                      let pairs =
+                        List.filter_map
+                          (fun n ->
+                            Option.map
+                              (fun id -> (id, Trait_encoding.binder_text n))
+                              (id_of_name n))
+                          sibling_names
+                      in
+                      Trait_encoding.with_binders
+                        ~header:(List.map snd pairs)
+                        ~siblings:pairs
+                        (fun () -> export_trait_decl_group id))
+            in
+            if plan = Trait_encoding.Plain && Config.backend () = Lean then (
               Format.pp_print_string fmt "mutual";
               Format.pp_print_break fmt 0 0);
-            List.iter (fun id -> export_trait_decl_group id) ids;
-            if mutual then (
+            List.iter print_decl ids;
+            if plan = Trait_encoding.Plain && Config.backend () = Lean then (
               Format.pp_print_break fmt 0 0;
               Format.pp_print_string fmt "end";
               Format.pp_print_break fmt 0 0);

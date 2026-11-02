@@ -15,8 +15,8 @@
     dictionary type whose fields quantify over [Type] inhabits [Type 1]), which
     is why the emitted binder is [Type (u+1)].
 
-    This module decides the shape from the group alone, so the decision is
-    testable without an LLBC fixture and without a formatter. *)
+    Everything here works on the translated model -- [Pure], which is what the
+    printer prints -- and not on the LLBC types, which are gone by this point. *)
 
 type member = {
   name : string;  (** the trait's Lean name, e.g. "serde_core.ser.Serialize" *)
@@ -75,108 +75,126 @@ let binder_text (trait_ : string) : string =
 
 (** Which traits a type mentions.
 
-    This has to be exhaustive over [ty_kind]: a cycle is created by any mention,
-    and the variants that hide one are not the obvious ones. A trait appears
+    The traversal is exhaustive over [ty]: a cycle is created by any mention, and
+    the variants that hide one are not the obvious ones. A trait appears
 
-    - directly in [TTraitType] -- a trait's type applied to arguments, which is
-      how a bound such as [S : Serializer<...>] is written;
+    - directly in [TTraitType] -- a trait's type applied to arguments;
     - inside [generic_args], which every applied type carries, including its
       [trait_refs] component;
-    - in the proof-carrying positions that do not read as types: the optional
-      [Sized] proof on [TArray] and [TSlice], and the predicates inside a
-      [dyn Trait] binder;
-    - in function-item and function-pointer types, through their signatures;
-    - and inside the [kind] of a trait reference itself, because [ParentClause]
-      and [TraitMethod] carry another trait reference.
+    - in an arrow, on either side;
+    - and inside a [dyn Trait] binder's clauses.
 
-    Leaves -- [TScalar], [TNever], [TVar], [TError] -- mention nothing. The
-    recursion is named [raw_*] and wrapped by a de-duplicating entry point, so
-    callers never see the same trait twice. *)
-let rec raw_traits_in_ty (t : Charon.Types.ty) : Charon.Types.trait_decl_id list =
-  let open Charon.Types in
+    There is no pointer, array, slice, pattern or function-item variant to walk:
+    [Pure] has already erased or lowered them, which is why this traversal is
+    shorter than the one over LLBC types it replaced.
+
+    Leaves -- [TVar], [TLiteral], [TNever], [TError] -- mention nothing. *)
+let rec raw_traits_in_ty (t : Pure.ty) : Pure.trait_decl_id list =
   match t with
-  | TScalar _ | TNever | TVar _ | TError _ -> []
-  | TRef (region, inner, _) ->
-      raw_traits_in_region region @ raw_traits_in_ty inner
-  | TRawPtr (inner, _) | TPtrMetadata inner -> raw_traits_in_ty inner
-  | TArray (inner, _, sized) | TSlice (inner, sized) ->
-      raw_traits_in_ty inner @ raw_traits_in_ref_opt sized
-  | TAdt d -> raw_traits_in_args d.generics
-  | TTraitType (r, _, args) -> raw_traits_in_ref r @ raw_traits_in_args args
-  | TPattern (scrutinee, _) -> raw_traits_in_ty scrutinee
-  | TFnDef b -> raw_traits_in_fn_ptr b.binder_value
-  | TFnPtr b ->
-      raw_traits_in_ty b.binder_value.output
-      @ List.concat_map raw_traits_in_ty b.binder_value.inputs
-  | TDynTrait d -> raw_traits_in_params d.binder.binder_params
+  | Pure.TAdt (_, args) -> raw_traits_in_args args
+  | Pure.TVar _ | Pure.TLiteral _ | Pure.TNever | Pure.TError -> []
+  | Pure.TArrow (arg, ret) -> raw_traits_in_ty arg @ raw_traits_in_ty ret
+  | Pure.TTraitType (r, _) -> raw_traits_in_ref r
+  | Pure.TDynTrait { params } -> raw_traits_in_params params
 
-(** A region can carry a type: [RLub] is the least upper bound of the regions of
-    a type, and that type may name a trait. *)
-and raw_traits_in_region (r : Charon.Types.region) :
-    Charon.Types.trait_decl_id list =
-  match r with
-  | Charon.Types.RLub t -> raw_traits_in_ty t
-  | Charon.Types.RVar _ | Charon.Types.RStatic | Charon.Types.RErased -> []
-  | Charon.Types.RBody _ -> []
-
-and raw_traits_in_args (args : Charon.Types.generic_args) :
-    Charon.Types.trait_decl_id list =
-  let open Charon.Types in
+and raw_traits_in_args (args : Pure.generic_args) : Pure.trait_decl_id list =
   List.concat_map raw_traits_in_ty args.types
-  @ List.concat_map
-      (fun (r : poly_trait_ref) ->
-        [ r.binder_value.trait_decl_ref.id ]
-        @ raw_traits_in_args r.binder_value.trait_decl_ref.generics)
-      args.trait_refs
+  @ List.concat_map raw_traits_in_ref args.trait_refs
 
-and raw_traits_in_ref (r : Charon.Types.trait_ref) :
-    Charon.Types.trait_decl_id list =
-  let open Charon.Types in
+and raw_traits_in_ref (r : Pure.trait_ref) : Pure.trait_decl_id list =
   let itself =
-    [ r.trait_decl_ref.id ] @ raw_traits_in_args r.trait_decl_ref.generics
+    [ r.trait_decl_ref.trait_decl_id ]
+    @ raw_traits_in_args r.trait_decl_ref.decl_generics
   in
   let from_kind =
-    match r.kind with
-    | TraitImpl i -> raw_traits_in_args i.generics
-    | Clause _ -> []
-    | ParentClause (parent, _, _) ->
-        [ parent.trait_decl_ref.id ]
-        @ raw_traits_in_args parent.trait_decl_ref.generics
-    | ItemClause _ -> []
-    | Self -> []
-    | Dyn -> []
-    | BuiltinOrAuto _ -> []
-    | UnknownTrait _ -> []
+    match r.trait_id with
+    (* A parent clause names the supertrait it comes from in its own right; the
+       instance it is projected from carries no further declaration. *)
+    | Pure.ParentClause (_, parent_id, _) -> [ parent_id ]
+    | Pure.TraitImpl (_, generics) -> raw_traits_in_args generics
+    | Pure.Self | Pure.Clause _ | Pure.BuiltinOrAuto _ | Pure.UnknownTrait _ ->
+        []
   in
   itself @ from_kind
 
-and raw_traits_in_ref_opt (r : Charon.Types.trait_ref option) :
-    Charon.Types.trait_decl_id list =
-  match r with None -> [] | Some r -> raw_traits_in_ref r
-
-and raw_traits_in_fn_ptr (p : Charon.Types.fn_ptr) :
-    Charon.Types.trait_decl_id list =
-  let open Charon.Types in
-  let from_kind =
-    match p.kind with Fun _ -> [] | TraitMethod (r, _) -> raw_traits_in_ref r
-  in
-  from_kind @ raw_traits_in_args p.generics
-
-and raw_traits_in_params (p : Charon.Types.generic_params) :
-    Charon.Types.trait_decl_id list =
+and raw_traits_in_params (params : Pure.generic_params) : Pure.trait_decl_id list
+    =
   List.concat_map
-    (fun (c : Charon.Types.trait_param) ->
-      let b = c.trait in
-      [ b.binder_value.id ] @ raw_traits_in_args b.binder_value.generics)
-    p.trait_clauses
-  @ List.concat_map
-      (fun (c : Charon.Types.trait_type_constraint Charon.Types.region_binder) ->
-        raw_traits_in_ref c.binder_value.trait_ref
-        @ raw_traits_in_ty c.binder_value.ty)
-      p.trait_type_constraints
+    (fun (c : Pure.trait_param) -> [ c.trait_id ] @ raw_traits_in_args c.generics)
+    params.trait_clauses
 
-(** The traits a type mentions, each listed once, in first-mention order. *)
-let traits_in_ty (t : Charon.Types.ty) : Charon.Types.trait_decl_id list =
+let uniq (ids : Pure.trait_decl_id list) : Pure.trait_decl_id list =
   List.fold_left
     (fun acc id -> if List.mem id acc then acc else acc @ [ id ])
-    [] (raw_traits_in_ty t)
+    [] ids
+
+(** The traits a type mentions, each listed once, in first-mention order. *)
+let traits_in_ty (t : Pure.ty) : Pure.trait_decl_id list =
+  uniq (raw_traits_in_ty t)
+
+(** Every trait a declaration mentions anywhere: its methods' signatures, the
+    clauses that make it a subtrait, and its associated constants' types.
+    Associated types contribute on their own only through the generics of their
+    binder, which the clauses already cover. *)
+let traits_in_decl (d : Pure.trait_decl) : Pure.trait_decl_id list =
+  let methods =
+    List.concat_map
+      (fun (m : Pure.trait_method) ->
+        raw_traits_in_ty m.signature.output
+        @ List.concat_map raw_traits_in_ty m.signature.inputs)
+      d.methods
+  in
+  let parent_clauses =
+    List.concat_map
+      (fun (c : Pure.trait_param) -> [ c.trait_id ] @ raw_traits_in_args c.generics)
+      d.parent_clauses
+  in
+  let consts = List.concat_map (fun (_, _, ty) -> raw_traits_in_ty ty) d.consts in
+  uniq (methods @ parent_clauses @ consts)
+
+(** Which of the mentioned names are sisters: inside the group, and not the
+    trait's own name. The trait itself must not become a parameter of itself --
+    that is the encoding's degenerate case, not a cycle -- and a name from
+    outside the group is declared elsewhere and orders itself. *)
+let siblings_of ~(this : string) ~(group : string list) (names : string list) :
+    string list =
+  List.filter (fun n -> n <> this && List.mem n group) names
+
+(** One member of a group: which of its sisters it names, by Lean name. *)
+let member_of_decl ~(this : string) ~(group : string list)
+    ~(name_of : Pure.trait_decl_id -> string option) (d : Pure.trait_decl) :
+    member =
+  let names = List.filter_map name_of (traits_in_decl d) in
+  { name = this; siblings = siblings_of ~this ~group names }
+
+(** The binders in force for the declaration being printed, keyed by the id of
+    the sister trait they stand for.
+
+    The printer's context is immutable and threaded through every print
+    function, so a scoped table is the smaller change; [with_binders] is the
+    only way in, and it restores the previous state on every exit path. *)
+let current_binders : (string, string) Hashtbl.t = Hashtbl.create 8
+
+let current_header : string list ref = ref []
+
+let with_binders ~(header : string list)
+    ~(siblings : (Pure.trait_decl_id * string) list) (f : unit -> unit) : unit =
+  let saved = Hashtbl.copy current_binders in
+  let saved_header = !current_header in
+  Hashtbl.reset current_binders;
+  List.iter
+    (fun (id, binder) ->
+      Hashtbl.replace current_binders (Pure.TraitDeclId.to_string id) binder)
+    siblings;
+  current_header := header;
+  Fun.protect f ~finally:(fun () ->
+      Hashtbl.reset current_binders;
+      Hashtbl.iter (fun k v -> Hashtbl.replace current_binders k v) saved;
+      current_header := saved_header)
+
+(** The binder standing for a trait in the declaration being printed, if any. *)
+let binder_for (id : Pure.trait_decl_id) : string option =
+  Hashtbl.find_opt current_binders (Pure.TraitDeclId.to_string id)
+
+(** The extra parameters to print on the declaration being printed's header. *)
+let header_binders () : string list = !current_header

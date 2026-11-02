@@ -536,6 +536,13 @@ and extract_trait_ref (span : Meta.span) (ctx : extraction_ctx)
 and extract_trait_decl_ref (span : Meta.span) (ctx : extraction_ctx)
     (fmt : F.formatter) (no_params_tys : TypeDeclId.Set.t) ~(inside : bool)
     (tr : trait_decl_ref) : unit =
+  match Trait_encoding.binder_for tr.trait_decl_id with
+  | Some binder ->
+      (* This trait is a sister of the declaration being printed, in a cyclic
+         group: naming it would be a forward reference, so it is named through
+         the parameter that carries its dictionary type. *)
+      F.pp_print_string fmt binder
+  | None ->
   let use_brackets = tr.decl_generics <> empty_generic_args && inside in
   let name = ctx_get_trait_decl span tr.trait_decl_id ctx in
   if use_brackets then F.pp_print_string fmt "(";
@@ -616,6 +623,13 @@ and extract_trait_instance_id_if_not_self (span : Meta.span)
 and extract_trait_instance_id (span : Meta.span) (ctx : extraction_ctx)
     (fmt : F.formatter) (no_params_tys : TypeDeclId.Set.t) ~(inside : bool)
     (trait_ref : trait_decl_ref) (id : trait_instance_id) : unit =
+  match Trait_encoding.binder_for trait_ref.trait_decl_id with
+  | Some binder ->
+      (* This trait is a sister of the declaration being printed, in a cyclic
+         group: naming it would be a forward reference, so it is named through
+         the parameter that carries its dictionary type. *)
+      F.pp_print_string fmt binder
+  | None ->
   let add_brackets (s : string) =
     if backend () = Coq then "(" ^ s ^ ")" else s
   in

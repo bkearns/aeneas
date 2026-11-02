@@ -3243,6 +3243,16 @@ let extract_trait_decl (ctx : extraction_ctx) (fmt : F.formatter)
     ~force_mono:true Item generics (Some decl.explicit_info) type_params
     cg_params trait_clauses;
 
+  (* Extra parameters standing for sister traits' dictionary types, when this
+     declaration belongs to a cyclic group that cannot be a [mutual] block.
+     They are installed by {!Trait_encoding.with_binders} around the printing of
+     this one declaration. *)
+  List.iter
+    (fun (binder : string) ->
+      F.pp_print_space fmt ();
+      F.pp_print_string fmt binder)
+    (Trait_encoding.header_binders ());
+
   F.pp_print_space fmt ();
   if is_empty && backend () = FStar then (
     F.pp_print_string fmt "= unit";
