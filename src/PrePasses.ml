@@ -932,8 +932,15 @@ let update_loops (crate : crate) (f : fun_decl) : fun_decl =
           match stl with
           | [] -> []
           | st :: stl ->
+              (* Rewrite what follows this statement first. Transformation 2/3
+                 moves the statements after a loop into its break sites, so when
+                 a loop is folded into an enclosing loop's break path it has
+                 already reached its final shape here. Left to right, the copy
+                 would be revisited while still unrewritten, and it would then
+                 have no statements after it to move into its own breaks. *)
+              let stl = update stl in
               let stl0, stl1 = self#update_statement depth st stl in
-              stl0 @ update stl1
+              stl0 @ stl1
         in
         { block with statements = update block.statements }
 
