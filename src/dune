@@ -246,3 +246,13 @@
  (alias runtest)
  (action
   (run ./test_trait_encoding.exe)))
+
+(executable
+ (name test_trait_types)
+ (modules Test_trait_types)
+ (libraries aeneas))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_trait_types.exe)))
