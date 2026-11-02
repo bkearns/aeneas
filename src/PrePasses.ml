@@ -162,10 +162,13 @@ let update_array_default (crate : crate) : crate =
      doesn't require that the type of the elements also has a default
      implementation. *)
   let matches_default_array (impl : trait_impl) : constant_expr option =
-    let trait_decl =
-      [%silent_unwrap_opt_span] (Some impl.item_meta.span)
-        (TraitDeclId.Map.find_opt impl.impl_trait.id crate.trait_decls)
-    in
+    (* An impl can name a trait declaration the crate does not carry -- an
+       external or filtered trait. That is not a reason to abort the prepass
+       for every impl in the crate: such an impl simply cannot be one of the
+       [Default<[T; N]>] impls this pass generalises, so it does not match. *)
+    match TraitDeclId.Map.find_opt impl.impl_trait.id crate.trait_decls with
+    | None -> None
+    | Some trait_decl ->
     if not (match_name impl_pat trait_decl.item_meta.name) then None
     else
       match impl.impl_trait.generics with

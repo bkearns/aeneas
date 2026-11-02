@@ -493,6 +493,24 @@ let loops_to_recursive_functions = ref false
       micro-passes *)
 let parallel = ref true
 
+(** Upper bound on the number of functions translated at once. [0] derives it
+    from the machine: one worker per core, minus the main domain. *)
+let max_parallel_jobs = ref 0
+
+(** Upper bound on the work in flight, in the statement counts used to size a
+    function. [0] derives it from the crate: twice its largest function. *)
+let parallel_budget = ref 0
+
+(** Attribute live memory to each function as it finishes, on stderr. Forces one
+    worker, because a delta measured while other domains translate belongs to them
+    too. *)
+let diagnose_memory = ref false
+
+(** Refuse to go past this much live data, in MiB, naming the function that crossed it.
+    [0] is no limit. Set by callers that would rather have a clear failure than a
+    cgroup kill. *)
+let memory_limit_mb = ref 0
+
 (** Display a progress bar *)
 let progress_bar = ref true
 

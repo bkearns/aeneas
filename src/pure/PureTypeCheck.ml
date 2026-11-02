@@ -20,10 +20,17 @@ let get_adt_field_types (span : Meta.span)
       [%sanity_check] span (generics.trait_refs = []);
       [%sanity_check] span (variant_id = None);
       generics.types
-  | TAdtId def_id ->
+  | TAdtId def_id -> (
       (* "Regular" ADT *)
-      let def = TypeDeclId.Map.find def_id type_decls in
-      type_decl_get_instantiated_fields_types def variant_id generics
+      match TypeDeclId.Map.find_opt def_id type_decls with
+      | Some def -> type_decl_get_instantiated_fields_types def variant_id generics
+      | None ->
+          (* The pattern names a type this crate does not declare. Reporting it
+             against the item keeps the rest of the crate translatable; a bare
+             [Map.find] here aborted the whole run with [Not_found]. *)
+          [%craise] span
+            ("Missing type declaration `" ^ TypeDeclId.to_string def_id
+           ^ "`, so its fields cannot be checked"))
   | TBuiltin aty -> (
       (* Builtin type *)
       match aty with

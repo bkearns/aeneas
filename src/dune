@@ -49,6 +49,7 @@
   ContextsBase
   Cps
   Deps
+  Diagnose
   Errors
   Expressions
   ExpressionsUtils
@@ -204,3 +205,23 @@
  (alias runtest)
  (action
   (run ./test_backend_names.exe)))
+
+(executable
+ (name test_parallel)
+ (modules Test_parallel)
+ (libraries aeneas))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_parallel.exe)))
+
+(executable
+ (name test_diagnose)
+ (modules Test_diagnose)
+ (libraries aeneas))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_diagnose.exe)))

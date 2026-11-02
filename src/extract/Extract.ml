@@ -972,23 +972,32 @@ and extract_function_call (span : Meta.span) (ctx : extraction_ctx)
          ]}
       *)
       (match fun_id with
-      | FromLlbc (TraitMethod (trait_ref, method_name), lp_id) ->
+      | FromLlbc (TraitMethod (trait_ref, method_name), lp_id) -> (
           let trait_decl_id = trait_ref.trait_decl_ref.trait_decl_id in
-          let trait_decl =
-            TraitDeclId.Map.find trait_decl_id ctx.trans_trait_decls
-          in
-
-          [%sanity_check] trait_decl.item_meta.span (lp_id = None);
-          extract_trait_ref trait_decl.item_meta.span ctx fmt
-            TypeDeclId.Set.empty ~inside:true trait_ref;
-          let fun_name =
-            ctx_get_trait_method span trait_ref.trait_decl_ref.trait_decl_id
-              method_name ctx
-          in
-          let add_brackets (s : string) =
-            if backend () = Coq then "(" ^ s ^ ")" else s
-          in
-          F.pp_print_string fmt ("." ^ add_brackets fun_name)
+          match TraitDeclId.Map.find_opt trait_decl_id ctx.trans_trait_decls with
+          | None ->
+              (* The call goes through a trait this crate does not declare, so
+                 there is no span to comment on and no method to qualify. A bare
+                 [Map.find] raised [Not_found] here and killed the whole run
+                 (ferrosa_index); a missing declaration is already an error, and
+                 the callee name degrades to the unqualified form. *)
+              [%save_error] span
+                "Missing trait declaration for a called trait method; printing \
+                 the callee without qualification";
+              let fun_name = ctx_get_function span fun_id ctx in
+              F.pp_print_string fmt fun_name
+          | Some trait_decl ->
+              [%sanity_check] trait_decl.item_meta.span (lp_id = None);
+              extract_trait_ref trait_decl.item_meta.span ctx fmt
+                TypeDeclId.Set.empty ~inside:true trait_ref;
+              let fun_name =
+                ctx_get_trait_method span trait_ref.trait_decl_ref.trait_decl_id
+                  method_name ctx
+              in
+              let add_brackets (s : string) =
+                if backend () = Coq then "(" ^ s ^ ")" else s
+              in
+              F.pp_print_string fmt ("." ^ add_brackets fun_name))
       | _ ->
           let fun_name = ctx_get_function span fun_id ctx in
           F.pp_print_string fmt fun_name);
@@ -1015,10 +1024,16 @@ and extract_function_call (span : Meta.span) (ctx : extraction_ctx)
             end
           | FromLlbc (TraitMethod (trait_ref, method_id), lp_id) -> begin
               [%sanity_check] span (lp_id = None);
-              let trait_decl =
-                TraitDeclId.Map.find trait_ref.trait_decl_ref.trait_decl_id
+              (* Same miss as above, and it is inside this [try] yet still fatal:
+                 the handler catches [CFailure], and a bare [Map.find] raises
+                 [Not_found]. The fallback below is exactly the "could not look
+                 up the declaration" case the handler was written for. *)
+              match
+                TraitDeclId.Map.find_opt trait_ref.trait_decl_ref.trait_decl_id
                   ctx.trans_trait_decls
-              in
+              with
+              | None -> [%craise] span "Could not lookup the trait declaration"
+              | Some trait_decl ->
               let meth =
                 List.find
                   (fun (meth : trait_method) -> meth.method_id = method_id)
@@ -1140,10 +1155,14 @@ and extract_field_projector (span : Meta.span) (ctx : extraction_ctx)
       let num_fields =
         match proj.adt_id with
         | TAdtId id -> (
-            let d = TypeDeclId.Map.find id ctx.trans_types in
-            match d.kind with
-            | Struct fields -> Some (List.length fields)
-            | _ -> None)
+            (* The declaration may not have been translated; the projection is
+               then printed the generic way instead of aborting the run. *)
+            match TypeDeclId.Map.find_opt id ctx.trans_types with
+            | None -> None
+            | Some d -> (
+                match d.kind with
+                | Struct fields -> Some (List.length fields)
+                | _ -> None))
         | _ -> None
       in
       let has_one_field =
@@ -3437,8 +3456,27 @@ let extract_trait_impl_method_items (ctx : extraction_ctx) (fmt : F.formatter)
     : unit =
   try extract_trait_impl_method_items_aux ctx fmt impl method_id fn
   with CFailure _ ->
-    F.pp_print_space fmt ();
-    extract_admit fmt
+    (* The method's body could not be translated, so the field gets an [admit] -- but the
+       field must be *named*. A bare [sorry] inside the record braces is not a structure
+       instance to Lean at all: it is a singleton set literal, and elaboration then fails
+       with "failed to synthesize instance of type class Singleton ... (Trait ...)", which
+       names a type class and reads like a missing instance rather than a printer fault.
+       The method name does not depend on the function that failed, so it is still
+       available here. *)
+    (try
+       let fun_name =
+         ctx_get_trait_method impl.item_meta.span impl.impl_trait.trait_decl_id
+           method_id ctx
+       in
+       extract_trait_impl_item ctx fmt fun_name (fun () ->
+           F.pp_print_space fmt ();
+           extract_admit fmt)
+     with CFailure _ ->
+       (* Only reachable if the trait declaration itself was never translated. *)
+       [%save_error] impl.item_meta.span
+         "Could not name the trait method of an untranslated implementation";
+       F.pp_print_space fmt ();
+       extract_admit fmt)
 
 (** Extract a trait implementation *)
 let extract_trait_impl (ctx : extraction_ctx) (fmt : F.formatter)
