@@ -489,19 +489,77 @@ let translate_crate_to_pure (crate : crate) (marked_ids : marked_ids) :
     (* Process a function *)
     let process (kind : string) (funs : (int * fun_decl) list) =
       let num_decls = List.length funs in
+      (* Bound the work in flight: the translation of one large function holds its whole
+         symbolic body, so letting the pool start every function at once multiplies the
+         biggest working sets. The budget is in statement counts, which is the size
+         measure already used to order the work; two of the largest functions in flight at
+         once keeps the bound proportional to the crate instead of to the core count. *)
+      let biggest =
+        List.fold_left
+          (fun acc (_, f) -> Stdlib.max acc (LlbcAstUtils.compute_fun_decl_size f))
+          0 funs
+      in
+      let budget =
+        if !Config.parallel_budget > 0 then !Config.parallel_budget
+        else Stdlib.max 1 (2 * biggest)
+      in
+      let max_jobs =
+        if !Config.max_parallel_jobs > 0 then !Config.max_parallel_jobs
+        else
+          max_jobs_for
+            ~available_mb:(available_memory_mb ())
+            ~cores:(Domain.recommended_domain_count ())
+      in
+      let max_jobs =
+        jobs_for_diagnosis
+          ~diagnose_memory:!Config.diagnose_memory ~max_jobs
+      in
       ProgressBar.with_parallel_reporter num_decls
         ("Translated " ^ kind ^ " functions: ")
         (fun report ->
-          parallel_filter_map
+          parallel_filter_map_bounded
+            ~cost:(fun (_, f) -> LlbcAstUtils.compute_fun_decl_size f)
+            ~budget ~max_jobs
             (fun (rank, x) ->
               let start =
                 if !Config.diagnose_translation then Unix.gettimeofday ()
                 else 0.0
               in
+              let live_before =
+                if !Config.diagnose_memory then (Gc.quick_stat ()).Gc.live_words
+                else 0
+              in
+              let size = LlbcAstUtils.compute_fun_decl_size x in
+              let name = name_to_string trans_ctx x.item_meta.name in
+              if !Config.diagnose_memory then
+                Diagnose.log_running ~name ~live_words:live_before ~size ~rank;
               let f =
                 translate_function_to_pure trans_ctx marked_ids type_decls_map
                   global_decls_map fun_sigs x
               in
+              if !Config.memory_limit_mb > 0 then begin
+                let live = (Gc.quick_stat ()).Gc.live_words in
+                if
+                  Diagnose.over_budget ~limit_mb:!Config.memory_limit_mb
+                    ~live_words:live
+                then begin
+                  prerr_endline
+                    (Diagnose.budget_message ~limit_mb:!Config.memory_limit_mb
+                       ~live_words:live ~last:name);
+                  exit 3
+                end
+              end;
+              if !Config.diagnose_memory then begin
+                (* Streamed, not collected: a run killed at a memory ceiling still names
+                   the last function it finished, and the next one is the suspect. *)
+                let live_after = (Gc.quick_stat ()).Gc.live_words in
+                Diagnose.log_memory
+                  ~name:(name_to_string trans_ctx x.item_meta.name)
+                  ~delta_words:(live_after - live_before)
+                  ~live_words:live_after
+                  ~size:(LlbcAstUtils.compute_fun_decl_size x)
+                  ~rank
+              end;
               if !Config.diagnose_translation then begin
                 let elapsed = Unix.gettimeofday () -. start in
                 let fname = name_to_string trans_ctx x.item_meta.name in

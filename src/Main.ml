@@ -228,6 +228,15 @@ let () =
          prefixes are: 's' (symbolic value id), 'b' (borrow id), 'a' \
          (abstraction id), 'r' (region id), 'f' (pure free variable id)." );
       ("-sequential", Arg.Clear parallel, " Execute sequentially");
+      ( "-max-parallel-jobs",
+        Arg.Int (fun x -> Config.max_parallel_jobs := x),
+        " Upper bound on the number of functions translated at once. 0, the \
+         default, derives one worker per core" );
+      ( "-parallel-budget",
+        Arg.Int (fun x -> Config.parallel_budget := x),
+        " Upper bound on the work in flight, in function-size units, so a run \
+         cannot hold every large function at once. 0, the default, derives \
+         twice the largest function in the crate. Ignored with -sequential" );
       ( "-no-progress-bar",
         Arg.Clear progress_bar,
         " Do not display a progress bar" );
@@ -300,6 +309,18 @@ let () =
         Arg.Set diagnose_translation,
         " Measure the time it takes to translate every function and print the \
          results sorted from longest to shortest" );
+      ( "-diagnose-memory",
+        Arg.Set diagnose_memory,
+        " Attribute live memory to each function as it finishes, streamed on \
+         stderr so a run killed at a memory ceiling still names its last \
+         completed function. Forces one worker so a delta belongs to one \
+         function" );
+      ( "-memory-limit-mb",
+        Arg.Int (fun x -> Config.memory_limit_mb := x),
+        " Refuse to go past this much live data, in MiB, naming the function \
+         that crossed it (exit status 3). 0, the default, is no limit. Prefer \
+         this to a cgroup ceiling: the process stays alive long enough to say \
+         which function was responsible" );
       ( "-diagnose-micro-passes",
         Arg.Set diagnose_micro_passes,
         " Measure the time it takes to apply the micro-passes on every \
