@@ -2216,16 +2216,25 @@ let eliminate_box_functions_visitor (ctx : ctx) (def : fun_decl) =
     method! visit_texpr env e =
       match opt_destruct_function_call e with
       | Some (fun_id, _generics, args) -> (
-          (* Below, when dealing with the arguments: we consider the very
-             general case, where functions could be boxed (meaning we
-             could have: [box_new f x]) *)
-          match fun_id with
-          | Fun (FromLlbc (FunId fid, _lp_id))
-            when (FunDeclId.Map.find fid ctx.fun_decls).item_meta
-                   .diagnostic_item = Some "box_new" ->
-              let arg, args = Collections.List.pop args in
-              [%add_loc] mk_apps span arg args
-          | _ -> super#visit_texpr env e)
+          (* The callee's declaration may be absent from [ctx.fun_decls]: a
+             function which was not translated (external, or whose body failed)
+             is not in the map. It is then certainly not one of the box
+             functions, so fall back to the plain traversal: an unguarded
+             [Map.find] here raises [Not_found] and loses the whole crate rather
+             than the one call. *)
+          let is_box_new =
+            match fun_id with
+            | Fun (FromLlbc (FunId fid, _lp_id)) -> (
+                match FunDeclId.Map.find_opt fid ctx.fun_decls with
+                | Some decl ->
+                    decl.item_meta.diagnostic_item = Some "box_new"
+                | None -> false)
+            | _ -> false
+          in
+          if is_box_new then
+            let arg, args = Collections.List.pop args in
+            [%add_loc] mk_apps span arg args
+          else super#visit_texpr env e)
       | _ -> super#visit_texpr env e
   end
 
@@ -2412,10 +2421,13 @@ let apply_beta_reduction_visitor (ctx : ctx) (def : fun_decl) =
 let apply_beta_reduction =
   lift_expr_map_visitor_with_state apply_beta_reduction_visitor FVarId.Map.empty
 
-(** Return whether a translated function matches [pattern]. *)
+(** Return whether a translated function matches [pattern]. A function which was
+    not translated is not in [ctx.fun_decls], and cannot be one of the standard
+    library functions we are looking for: it does not match. *)
 let fun_matches_name (ctx : ctx) (fid : FunDeclId.id) pattern : bool =
-  let decl = FunDeclId.Map.find fid ctx.fun_decls in
-  ExtractName.match_name ctx.crate pattern decl.item_meta.name
+  match FunDeclId.Map.find_opt fid ctx.fun_decls with
+  | Some decl -> ExtractName.match_name ctx.crate pattern decl.item_meta.name
+  | None -> false
 
 let slice_index_mut_usize_pattern =
   NameMatcher.parse_pattern
