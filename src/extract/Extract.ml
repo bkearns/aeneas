@@ -2078,7 +2078,16 @@ let extract_fun_parameters (space : bool ref) (ctx : extraction_ctx)
 let extract_fun_input_parameters_types (span : span) (ctx : extraction_ctx)
     (fmt : F.formatter) (inputs : ty list) : unit =
   let extract_param (ty : ty) : unit =
-    let inside = false in
+    (* The arrow is right-associative, so an input whose type is itself an arrow has to be
+       parenthesised: [call_once : (T → Result (Option T)) → T → Result (Option T)]. Without
+       the parentheses the same arrows flatten into two more arguments, and Lean then reports
+       a type mismatch at the *use* site with the whole signature printed twice --
+       [T → Result (Option T) → T → Result (Option T)] where a single argument was expected. *)
+    let inside =
+      match ty with
+      | TArrow _ -> true
+      | _ -> false
+    in
     extract_ty span ctx fmt TypeDeclId.Set.empty ~inside ty;
     F.pp_print_space fmt ();
     extract_arrow fmt ();
@@ -3776,6 +3785,53 @@ let extract_trait_impl_method_items (ctx : extraction_ctx) (fmt : F.formatter)
        F.pp_print_space fmt ();
        extract_admit fmt)
 
+(** Does the value printed for a trait reference mention the given trait implementation?
+
+    A trait reference prints, for a resolved implementation, the implementation's Lean name
+    followed by its generic arguments; those arguments are types, and a type carries the
+    trait references it needs (see {!TAdt}), which carry implementations in turn. Everything
+    that can reach a printed name is therefore reachable from here.
+
+    This is what tells a *legitimate* self-reference from a resolvable one: an implementation
+    can be named by its own parent clause, because the clause is discharged by a blanket
+    implementation that takes the implementation being defined as a dictionary argument
+    ([impl<T: PemObjectFilter> PemObject for T] used for [Self: PemObject]). *)
+let rec ty_mentions_trait_impl (impl_id : TraitImplId.id) (ty : ty) : bool =
+  match ty with
+  | TAdt (_, args) -> generic_args_mention_trait_impl impl_id args
+  | TArrow (ty0, ty1) ->
+      ty_mentions_trait_impl impl_id ty0 || ty_mentions_trait_impl impl_id ty1
+  | TTraitType (trait_ref, _) -> trait_ref_mentions_trait_impl impl_id trait_ref
+  | TDynTrait { params } -> generic_params_mention_trait_impl impl_id params
+  | TVar _ | TLiteral _ | TNever | TError -> false
+
+and generic_params_mention_trait_impl (impl_id : TraitImplId.id)
+    (params : generic_params) : bool =
+  List.exists
+    (fun (c : trait_param) ->
+      generic_args_mention_trait_impl impl_id c.generics)
+    params.trait_clauses
+
+and generic_args_mention_trait_impl (impl_id : TraitImplId.id)
+    (args : generic_args) : bool =
+  List.exists (ty_mentions_trait_impl impl_id) args.types
+  || List.exists (trait_ref_mentions_trait_impl impl_id) args.trait_refs
+
+and trait_ref_mentions_trait_impl (impl_id : TraitImplId.id)
+    (trait_ref : trait_ref) : bool =
+  trait_instance_id_mentions_trait_impl impl_id trait_ref.trait_id
+  || generic_args_mention_trait_impl impl_id
+       trait_ref.trait_decl_ref.decl_generics
+
+and trait_instance_id_mentions_trait_impl (impl_id : TraitImplId.id)
+    (tid : trait_instance_id) : bool =
+  match tid with
+  | TraitImpl (id, args) ->
+      id = impl_id || generic_args_mention_trait_impl impl_id args
+  | ParentClause (tid, _, _) ->
+      trait_instance_id_mentions_trait_impl impl_id tid
+  | Self | Clause _ | BuiltinOrAuto _ | UnknownTrait _ -> false
+
 (** Generate the body of a trait implementation. *)
 let extract_trait_impl_gen (ctx : extraction_ctx) (fmt : F.formatter)
     ~(is_rec : bool) (impl : trait_impl) : unit =
@@ -3983,16 +4039,34 @@ let extract_trait_impl_gen (ctx : extraction_ctx) (fmt : F.formatter)
         extract_trait_impl_item ctx fmt item_name ty)
       impl.types;
 
-    (* The parent clauses *)
+    (* The parent clauses.
+
+       A parent clause is discharged by whatever implementation satisfies it, and that can be
+       the implementation being defined: a blanket implementation over the child
+       ([impl<T: PemObjectFilter> PemObject for T]) takes the child's dictionary as an
+       argument, so the printed value names the implementation we are inside of
+       ([PemObjectInst := PemObject.Blanket PemObjectFilterInst ...]). The value is then
+       genuinely cyclic -- the parent's field is the child and the child's parent field is the
+       parent -- and Lean has no cyclic values: [impl_def] only breaks a cycle it can rewrite
+       into projections of already-resolved fields, and an application of another
+       implementation is not one of those. No finite term exists, so admit the field rather
+       than failing the whole implementation, which would also lose every use of it (each
+       becomes an unknown identifier). *)
     List.iter
       (fun (clause, trait_ref) ->
         let item_name =
           ctx_get_trait_parent_clause span trait_decl_id clause.T.clause_id ctx
         in
+        let is_cyclic =
+          backend () = Lean
+          && trait_ref_mentions_trait_impl impl.def_id trait_ref
+        in
         let ty () =
           F.pp_print_space fmt ();
-          extract_trait_ref span ctx fmt TypeDeclId.Set.empty ~inside:false
-            trait_ref
+          if is_cyclic then extract_admit fmt
+          else
+            extract_trait_ref span ctx fmt TypeDeclId.Set.empty ~inside:false
+              trait_ref
         in
         extract_trait_impl_item ctx fmt item_name ty)
       (List.combine trait_decl.implied_clauses impl.parent_trait_refs);

@@ -66,6 +66,36 @@ let impl_ref (impl : int) (id : int) : Pure.trait_ref =
 let args_with_types (types : Pure.ty list) : Pure.generic_args =
   { no_args with types }
 
+(* A parent clause discharged by a blanket implementation over the child:
+   [impl<T: Filter> Parent for T] used for [Self: Parent] prints as the blanket impl applied
+   to the child's dictionary, so the value names the implementation being defined. *)
+let blanket_over (child : int) (parent : int) : Pure.trait_ref =
+  {
+    trait_id =
+      Pure.TraitImpl
+        ( Charon.Types.TraitImplId.of_int 7,
+          { no_args with trait_refs = [ impl_ref child 3 ] } );
+    trait_decl_ref =
+      { trait_decl_id = Pure.TraitDeclId.of_int parent; decl_generics = no_args };
+  }
+
+(* The two printers below: a parent clause that names the implementation being defined cannot
+   be written down as a Lean term, so it is admitted; one that does not must be left alone. *)
+let () =
+  let child = Charon.Types.TraitImplId.of_int 3 in
+  check "a parent clause naming the impl is seen"
+    (Extract.trait_ref_mentions_trait_impl child (blanket_over 3 2))
+    "";
+  check "a parent clause over an unrelated impl is not seen"
+    (not
+       (Extract.trait_ref_mentions_trait_impl
+          (Charon.Types.TraitImplId.of_int 4)
+          (blanket_over 3 2)))
+    "";
+  check "a direct implementation reference is seen"
+    (Extract.trait_ref_mentions_trait_impl child (impl_ref 3 1))
+    ""
+
 let args_with_refs (refs : Pure.trait_ref list) : Pure.generic_args =
   { no_args with trait_refs = refs }
 
