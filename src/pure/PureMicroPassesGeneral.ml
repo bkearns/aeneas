@@ -3101,6 +3101,38 @@ let add_fuel_one (ctx : ctx) (loops : fun_decl LoopId.Map.t) (def : fun_decl) :
   in
   let def = { def with signature = sg } in
 
+  (* The declaration a call names.
+
+     [ctx.fun_decls] holds the functions this run translated, so a callee whose
+     own translation failed has no entry. This pass needs the callee's signature
+     to decide whether to pass fuel, and there is no sound answer without it: a
+     guess would be a wrong model, so the miss is reported against the call and
+     names the callee rather than escaping as a [Not_found] that loses the file.
+     A loop is looked up in the loop bodies of the function being processed; the
+     same reasoning applies, and the name says which loop. *)
+  let callee_name (fid : FunDeclId.id) : string =
+    match FunDeclId.Map.find_opt fid ctx.crate.fun_decls with
+    | Some decl -> name_to_string ctx.trans_ctx decl.item_meta.name
+    | None -> "function #" ^ FunDeclId.to_string fid
+  in
+  let callee_decl (span : Meta.span) (def : fun_decl) (fid : FunDeclId.id)
+      (lp_id : (LoopId.id * bool) option) : fun_decl =
+    match lp_id with
+    | None ->
+        [%decl_lookup]
+          (Some span) ~what:"the callee" ~name:(callee_name fid)
+          (fun id -> FunDeclId.Map.find_opt id ctx.fun_decls)
+          fid
+    | Some (lp_id, _) ->
+        [%sanity_check] span (fid = def.def_id);
+        [%decl_lookup]
+          (Some span)
+          ~what:("the loop body of '" ^ callee_name fid ^ "'")
+          ~name:("loop #" ^ LoopId.to_string lp_id)
+          (fun id -> LoopId.Map.find_opt id loops)
+          lp_id
+  in
+
   (* Small helper: update a call by adding the fuel and state parameters, return
      the updated expession together with the new state *)
   let update_call (f : texpr) (args : texpr list) (fuel : texpr option) : texpr
@@ -3137,13 +3169,7 @@ let add_fuel_one (ctx : ctx) (loops : fun_decl LoopId.Map.t) (def : fun_decl) :
           match f.e with
           | Qualif { id = FunOrOp (Fun (FromLlbc (FunId fid', lp_id))); _ } ->
               (* Lookup the decl *)
-              let def' : fun_decl =
-                match lp_id with
-                | None -> FunDeclId.Map.find fid' ctx.fun_decls
-                | Some (lp_id, _) ->
-                    [%sanity_check] span (fid' = def.def_id);
-                    LoopId.Map.find lp_id loops
-              in
+              let def' : fun_decl = callee_decl span def fid' lp_id in
               [%ldebug
                 "def'.signature.inputs:\n"
                 ^ Print.list_to_string (ty_to_string ctx) def'.signature.inputs];
@@ -3169,13 +3195,7 @@ let add_fuel_one (ctx : ctx) (loops : fun_decl LoopId.Map.t) (def : fun_decl) :
           match f.e with
           | Qualif { id = FunOrOp (Fun (FromLlbc (FunId fid', lp_id))); _ } ->
               (* Lookup the decl *)
-              let def' : fun_decl =
-                match lp_id with
-                | None -> FunDeclId.Map.find fid' ctx.fun_decls
-                | Some (lp_id, _) ->
-                    [%sanity_check] span (fid' = def.def_id);
-                    LoopId.Map.find lp_id loops
-              in
+              let def' : fun_decl = callee_decl span def fid' lp_id in
               (* This should be a full application *)
               [%sanity_check] span
                 (List.length args = List.length def'.signature.inputs);

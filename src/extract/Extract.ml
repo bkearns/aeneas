@@ -1044,12 +1044,14 @@ and extract_function_call (span : Meta.span) (ctx : extraction_ctx)
           | None ->
               (* The call goes through a trait this crate does not declare, so
                  there is no span to comment on and no method to qualify. A bare
-                 [Map.find] raised [Not_found] here and killed the whole run
-                 (ferrosa_index); a missing declaration is already an error, and
-                 the callee name degrades to the unqualified form. *)
+                 [Map.find] raised [Not_found] here and killed the whole run; a
+                 missing declaration is already an error, and the callee name
+                 degrades to the unqualified form. The report names the method
+                 that could not be qualified. *)
               [%save_error] span
-                "Missing trait declaration for a called trait method; printing \
-                 the callee without qualification";
+                (Decl_lookup.msg ~what:"the trait declaration of the called method"
+                   ~name:(ctx_get_function span fun_id ctx)
+                ^ "; printing the callee without qualification");
               let fun_name = ctx_get_function span fun_id ctx in
               F.pp_print_string fmt fun_name
           | Some trait_decl ->
@@ -3844,7 +3846,19 @@ let extract_trait_impl_gen (ctx : extraction_ctx) (fmt : F.formatter)
   (* Print a comment to link the extracted type to its original rust definition *)
   begin
     let decl_id = impl.impl_trait.trait_decl_id in
-    let trait_decl = TraitDeclId.Map.find decl_id ctx.trans_trait_decls in
+    (* The trait of an implementation is normally translated with it -- and an
+       implementation whose trait is not is skipped by
+       [Translate.trait_impl_is_builtin] -- but "normally" is not "always", and a
+       miss here used to end the whole file. Name the implementation so a report
+       says which one. *)
+    let trait_decl =
+      [%decl_lookup]
+        (Some span)
+        ~what:"the trait declaration of the implementation"
+        ~name:impl.name
+        (fun id -> TraitDeclId.Map.find_opt id ctx.trans_trait_decls)
+        decl_id
+    in
     let decl_ref = impl.llbc_impl_trait in
     let name = trait_decl.item_meta.name in
     let generics = (impl.llbc_generics, decl_ref.generics) in
@@ -3918,7 +3932,14 @@ let extract_trait_impl_gen (ctx : extraction_ctx) (fmt : F.formatter)
      See the comment in {!extract_trait_decl}. *)
   let ctx =
     let decl_id = impl.impl_trait.trait_decl_id in
-    let trait_decl = TraitDeclId.Map.find decl_id ctx.trans_trait_decls in
+    let trait_decl =
+      [%decl_lookup]
+        (Some span)
+        ~what:"the trait declaration of the implementation"
+        ~name:impl.name
+        (fun id -> TraitDeclId.Map.find_opt id ctx.trans_trait_decls)
+        decl_id
+    in
     let field_names =
       List.map
         (fun (const_id, _, _) -> ctx_get_trait_const span decl_id const_id ctx)
@@ -3977,7 +3998,14 @@ let extract_trait_impl_gen (ctx : extraction_ctx) (fmt : F.formatter)
      * Extract the items
      *)
     let trait_decl_id = impl.impl_trait.trait_decl_id in
-    let trait_decl = TraitDeclId.Map.find trait_decl_id ctx.crate.trait_decls in
+    let trait_decl =
+      [%decl_lookup]
+        (Some span)
+        ~what:"the trait declaration of the implementation"
+        ~name:impl.name
+        (fun id -> TraitDeclId.Map.find_opt id ctx.trans_ctx.crate.trait_decls)
+        trait_decl_id
+    in
 
     (* The constants *)
     List.iter

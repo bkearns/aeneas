@@ -22,9 +22,20 @@ let _ =
   main_log#set_level EL.Info;
   Logs.Src.set_level Charon.Logging.llbc_of_json_logger (Some Logs.Info)
 
-(* This is necessary to have a backtrace when raising exceptions - for some
- * reason, the -g option doesn't work.
- * TODO: run with OCAMLRUNPARAM=b=1? *)
+(* Record a backtrace at every raise, unconditionally, and print it for any
+ * exception that escapes the translator.
+ *
+ * `-g` alone is not enough: the runtime only fills in a backtrace when recording
+ * is switched on, so without this an uncaught exception prints
+ * "Fatal error: exception Not_found" and nothing else -- no file, no line, and no
+ * way to tell which of the lookups in the translator raised it. The cost is only
+ * paid when something is raised, and a crash that names its own site is worth
+ * that. Nothing has to be set in the environment to get the trace;
+ * `OCAMLRUNPARAM=b` merely adds the runtime's own frames.
+ *
+ * A raise inside a worker domain does not inherit this, so every parallel entry
+ * point goes through `Parallel.run_with_backtrace`, which switches it on there
+ * and re-raises with the original raw backtrace (see `Parallel.ml`). *)
 let () = Printexc.record_backtrace true
 
 (* Bound the major heap against live data.

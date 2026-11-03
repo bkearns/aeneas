@@ -48,6 +48,7 @@
   Contexts
   ContextsBase
   Cps
+  Decl_lookup
   Deps
   Diagnose
   Errors
@@ -257,3 +258,13 @@
  (alias runtest)
  (action
   (run ./test_trait_types.exe)))
+
+(executable
+ (name test_decl_lookup)
+ (modules Test_decl_lookup)
+ (libraries aeneas))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_decl_lookup.exe)))

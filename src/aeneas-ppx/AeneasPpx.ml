@@ -95,6 +95,9 @@ let () =
           [ "extract_raise"; "admit_raise"; "admit_string" ]
       (* The rules for the helpers in `PureErrors.ml` *)
       @ [ mk_check_rule "PureErrors" "pure_type_check" ]
+      (* A translated-declaration lookup: the caller's location, so a miss
+         names the site that wanted the declaration and not `Decl_lookup`. *)
+      @ [ mk_check_rule "Decl_lookup" "decl_lookup" ]
       (* Misc. *)
       @ [ mk_raw_check_rule "Errors.add_loc" "add_loc" ])
     "expand_asserts"

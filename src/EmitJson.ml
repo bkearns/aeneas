@@ -253,7 +253,12 @@ let trait_impl_entry_of_trait_impl (ctx : ExtractBase.extraction_ctx)
   let span = def.item_meta.span in
   let impl_trait_id = def.impl_trait.trait_decl_id in
   let impl_trait_decl =
-    Pure.TraitDeclId.Map.find impl_trait_id ctx.trans_trait_decls
+    [%decl_lookup]
+      (Some span)
+      ~what:"the trait declaration of the implementation"
+      ~name:def.name
+      (fun id -> Pure.TraitDeclId.Map.find_opt id ctx.trans_trait_decls)
+      impl_trait_id
   in
   {
     def_id = Pure.TraitImplId.to_int def.def_id;
