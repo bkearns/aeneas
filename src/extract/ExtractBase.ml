@@ -454,6 +454,15 @@ let names_maps_add (id_to_string : id -> string) (id : id)
 let untranslated_type_names = ref StringSet.empty
 let untranslated_type_decls = ref []
 
+(* Names this run does declare. A lookup miss does not prove absence: under -split-files the
+   names are registered per module, so a type declared in another file of the same package (or
+   later in this one) misses the map here and would get a stub that collides with its own
+   declaration ("`X` has already been declared"). *)
+let declared_type_names = ref StringSet.empty
+
+let note_declared_type ~(name : string) : unit =
+  declared_type_names := StringSet.add name !declared_type_names
+
 let register_untranslated_type ~(name : string) : bool =
   if StringSet.mem name !untranslated_type_names then false
   else (
@@ -510,6 +519,7 @@ let names_maps_get (span : Meta.span option) (id_to_string : id -> string)
             match id with
             | TypeId _ -> (
                 match stub_name_of_type_error err with
+                | Some name when StringSet.mem name !declared_type_names -> name
                 | Some name ->
                     ignore (register_untranslated_type ~name);
                     name

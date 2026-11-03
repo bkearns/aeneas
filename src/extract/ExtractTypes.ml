@@ -864,6 +864,7 @@ let extract_type_decl_register_names (ctx : extraction_ctx) (def : type_decl) :
     | None -> ctx_compute_type_decl_name ctx def
     | Some info -> info.extract_name
   in
+  note_declared_type ~name:def_name;
   let ctx = ctx_add span (TypeId (TAdtId def.def_id)) def_name ctx in
   (* Compute and register:
    * - the variant names, if this is an enumeration
