@@ -127,11 +127,12 @@ let translate_function_to_pure_aux (trans_ctx : trans_ctx)
     trans_ctx.type_ctx.type_decls fdef;
 
   (* Compute the symbolic ASTs, if the function is transparent *)
+  Diagnose.set_phase ~clear_item:false "symbolic";
   let symbolic_trans =
     translate_function_to_symbolics trans_ctx marked_ids fdef
   in
-
   (* Convert the symbolic ASTs to pure ASTs: *)
+  Diagnose.set_phase ~clear_item:false "to-pure";
 
   (* Initialize the context *)
   let sv_to_var = SymbolicValueId.Map.empty in
@@ -318,9 +319,11 @@ let translate_crate_to_pure (crate : crate) (marked_ids : marked_ids) :
   [%ltrace ""];
 
   (* Compute the translation context *)
+  Diagnose.set_phase "contexts";
   let trans_ctx = compute_contexts crate in
 
   (* Translate all the type definitions *)
+  Diagnose.set_phase "type-decls";
   let type_decls = SymbolicToPure.translate_type_decls trans_ctx in
 
   (* Compute the type definition map *)
@@ -334,6 +337,7 @@ let translate_crate_to_pure (crate : crate) (marked_ids : marked_ids) :
      as the "regular" functions) *)
   let global_decls =
     let num_decls = GlobalDeclId.Map.cardinal crate.global_decls in
+    Diagnose.set_phase "globals";
     ProgressBar.with_reporter num_decls "Translated globals: " (fun report ->
         List.filter_map
           (fun (global : global_decl) ->
@@ -493,6 +497,7 @@ let translate_crate_to_pure (crate : crate) (marked_ids : marked_ids) :
     (* Process a function *)
     let process (kind : string) (funs : (int * fun_decl) list) =
       let num_decls = List.length funs in
+      Diagnose.set_phase (kind ^ "-functions");
       (* Bound the work in flight: the translation of one large function holds its whole
          symbolic body, so letting the pool start every function at once multiplies the
          biggest working sets. The budget is in statement counts, which is the size
@@ -537,6 +542,7 @@ let translate_crate_to_pure (crate : crate) (marked_ids : marked_ids) :
               let name = name_to_string trans_ctx x.item_meta.name in
               if !Config.diagnose_memory then
                 Diagnose.log_running ~name ~live_words:live_before ~size ~rank;
+              if Diagnose.sampling_enabled () then Diagnose.set_item name;
               let f =
                 Errors.with_current_item name (fun () ->
                     translate_function_to_pure trans_ctx marked_ids
@@ -606,6 +612,7 @@ let translate_crate_to_pure (crate : crate) (marked_ids : marked_ids) :
   (* Translate the trait declarations *)
   let trait_decls =
     let num_decls = TraitDeclId.Map.cardinal crate.trait_decls in
+    Diagnose.set_phase "trait-declarations";
     ProgressBar.with_reporter num_decls "Translated trait declarations: "
       (fun report ->
         List.filter_map
@@ -642,6 +649,7 @@ let translate_crate_to_pure (crate : crate) (marked_ids : marked_ids) :
   (* Translate the trait implementations *)
   let trait_impls =
     let num_decls = TraitImplId.Map.cardinal crate.trait_impls in
+    Diagnose.set_phase "trait-impls";
     ProgressBar.with_reporter num_decls "Translated trait impls: "
       (fun report ->
         List.filter_map
@@ -676,6 +684,7 @@ let translate_crate_to_pure (crate : crate) (marked_ids : marked_ids) :
   in
 
   (* Apply the micro-passes *)
+  Diagnose.set_phase "micro-passes";
   let pure_translations =
     Micro.apply_passes_to_pure_fun_translations crate trans_ctx type_decls
       trait_impls pure_translations
@@ -2599,5 +2608,6 @@ let translate_crate (filename : string) (dest_dir : string)
   (* Translate the module to the pure AST *)
   let trans_ctx, trans_crate = translate_crate_to_pure crate marked_ids in
 
+  Diagnose.set_phase "emit";
   extract_translated_crate filename dest_dir subdir crate trans_ctx trans_crate
     extracted_opaque

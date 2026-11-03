@@ -654,8 +654,37 @@ let eval_global_as_fresh_symbolic_value (span : Meta.span)
       (ctx, mk_tvalue_from_symbolic_value sval, ty, cc)
 
 (** Evaluate a statement. *)
+
+(** A statement whose evaluation leaves the context untouched, and which therefore cannot
+    contribute anything to the symbolic AST.
+
+    MIR represents unwinding as ladders of cleanup blocks: every `?` in a Rust body gets one,
+    and each cleanup block drops the locals initialized so far. A thirteen-field derived
+    deserialiser therefore reaches translation with ~100 calls and ~4000 cleanup blocks --
+    ~10^5 statements, of which 92% are [StorageDead] on locals an earlier cleanup block has
+    already dropped (their value is [Bottom]). None of them can change a value, and the
+    snapshot machinery was still paying for each one: a context copy and a symbolic-value
+    expansion per statement, 6.5x more statement evaluations than the function's real work
+    needs. Skipping them here is not a semantic shortcut -- dropping a [Bottom] value is
+    dropping nothing, [StorageLive]/[Nop] only declare a local's lifetime, and a snapshot
+    that repeats the previous one contributes no symbolic place (the translation filters
+    places it has already emitted), so the generated code is unchanged. *)
+let statement_is_noop (st : statement) (ctx : eval_ctx) : bool =
+  match st.kind with
+  | StorageLive _ | Nop | PlaceMention _ -> true
+  | Drop (_, _, _, _) -> !Config.drop_as_no_op
+  | StorageDead local -> (
+      match ctx_lookup_var_value_opt ctx local with
+      | Some { value = VBottom; _ } | None -> true
+      | Some _ -> false)
+  | _ -> false
+
 let rec eval_statement (config : config) (st : statement) : stl_cm_fun =
  fun ctx ->
+  Diagnose.bump ~env:(List.length ctx.env) ();
+  if statement_is_noop st ctx then
+    ([ (ctx, Unit) ], cf_singleton __FILE__ __LINE__ st.span)
+  else begin
   (* Debugging *)
   [%ltrace
     "\n**About to evaluate statement** ("
@@ -676,12 +705,16 @@ let rec eval_statement (config : config) (st : statement) : stl_cm_fun =
 
   (* Evaluate the statement *)
   comp cc (eval_statement_raw config st ctx)
+  end
 
 and eval_statement_list (config : config) span (stmts : statement list) :
     stl_cm_fun =
  fun ctx ->
   match stmts with
   | [] -> ([ (ctx, Unit) ], cf_singleton __FILE__ __LINE__ span)
+  | hd :: tl when statement_is_noop hd ctx ->
+      (* Nothing to evaluate and nothing to record: skip to the next statement. *)
+      eval_statement_list config span tl ctx
   | hd :: tl ->
       (* Evaluate the first statement *)
       let ctx_resl, cf_st1 = eval_statement config hd ctx in

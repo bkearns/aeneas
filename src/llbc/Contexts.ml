@@ -260,6 +260,24 @@ let ctx_lookup_var_value (span : Meta.span) (ctx : eval_ctx) (vid : LocalId.id)
     : tvalue =
   env_lookup_var_value span ctx.env vid
 
+(** Retrieve a variable's value in the current frame, if it is still bound there.
+
+    Unlike {!env_lookup_var_value} this does not raise: it is used on the evaluation fast
+    path, where the question is only "does this local still hold a value?", and a local
+    that is not in the frame (never initialized, or already popped) plainly does not. *)
+let env_lookup_var_value_opt (env : env) (vid : LocalId.id) : tvalue option =
+  let rec lookup env =
+    match env with
+    | [] | EFrame :: _ -> None
+    | EBinding (BVar var, v) :: env' ->
+        if var.index = vid then Some v else lookup env'
+    | (EBinding (BDummy _, _) | EAbs _) :: env' -> lookup env'
+  in
+  lookup env
+
+let ctx_lookup_var_value_opt (ctx : eval_ctx) (vid : LocalId.id) : tvalue option =
+  env_lookup_var_value_opt ctx.env vid
+
 (** Retrieve a const generic value in an evaluation context *)
 let ctx_lookup_const_generic_value (ctx : eval_ctx) (vid : ConstGenericVarId.id)
     : tvalue =

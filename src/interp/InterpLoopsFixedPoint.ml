@@ -160,6 +160,7 @@ let compute_loop_entry_fixed_point (config : config) (span : Meta.span)
        ^ " iterations"))
     else
       (* Evaluate the loop body to register the different contexts upon reentry *)
+      Diagnose.set_phase ~clear_item:false ("loop-iter-" ^ string_of_int i);
       let ctx_resl, _ = eval_loop_body ctx in
       (* Keep only the contexts which reached a `continue`. *)
       let keep_continue_ctx (ctx, res) =

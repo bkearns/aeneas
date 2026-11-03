@@ -298,3 +298,13 @@
  (alias runtest)
  (action
   (run ./test_instantiation_arity.exe)))
+
+(executable
+ (name test_mem_report)
+ (modules Test_mem_report)
+ (libraries aeneas unix))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_mem_report.exe)))

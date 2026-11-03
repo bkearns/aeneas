@@ -53,8 +53,10 @@ let () =
   Gc.set { ctrl with space_overhead = 20 }
 
 (* Heap diagnostics, for deciding whether a run that dies of memory is holding live data or just
-   allocator high-water. Printed every 30s, on the usual terminate signals, and at exit: a run
-   killed by a cgroup ceiling or a timeout then still says which of the two it was. *)
+   allocator high-water. The full collector statistics still go to stderr at exit and on the
+   catchable terminate signals, but a cgroup ceiling sends SIGKILL, which none of that survives --
+   so the phase-labelled samples go to the file named by [AENEAS_STAT_FILE] instead (see
+   [Diagnose]). *)
 let () =
   let report () =
     Gc.print_stat stderr;
@@ -71,12 +73,7 @@ let () =
        (fun _ ->
          report ();
          exit 1));
-  try
-    ignore
-      (Unix.setitimer Unix.ITIMER_REAL
-         { Unix.it_interval = 30.0; it_value = 30.0 });
-    Sys.set_signal Sys.sigalrm (Sys.Signal_handle (fun _ -> report ()))
-  with _ -> ()
+  Diagnose.start_sampler ()
 
 let usage =
   Printf.sprintf
@@ -663,6 +660,7 @@ let () =
   in
 
   (* Load the module *)
+  Diagnose.set_phase "load-llbc";
   match crate_of_json_file filename with
   | Error s ->
       log#error "error: %s\n" s;
@@ -835,6 +833,7 @@ let () =
         ());
 
       (* Apply the pre-passes *)
+      Diagnose.set_phase "prepasses";
       let m =
         try Aeneas.PrePasses.apply_passes m
         with Errors.CFailure error -> fail_crate error

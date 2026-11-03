@@ -351,6 +351,7 @@ let eval_loop_symbolic (config : config) (span : span)
   let loop_id = ctx.fresh_loop_id () in
 
   (* Compute the fixed point at the loop entrance *)
+  Diagnose.set_phase ~clear_item:false "loop-fixed-point";
   let fp_ctx, fixed_ids =
     compute_loop_entry_fixed_point config span loop_id eval_loop_body ctx
   in
@@ -376,6 +377,7 @@ let eval_loop_symbolic (config : config) (span : span)
   let fixed_aids = InterpJoinCore.compute_fixed_abs_ids ctx fp_ctx in
   let fixed_dids = ctx_get_dummy_var_ids ctx in
   let break_info =
+    Diagnose.set_phase ~clear_item:false "loop-break-ctx";
     compute_loop_break_context config span loop_id eval_loop_body fp_ctx
       fixed_aids fixed_dids
   in
@@ -445,6 +447,7 @@ let eval_loop_symbolic (config : config) (span : span)
 
   (* Synthesize the loop body *)
   let break_info', loop_body =
+    Diagnose.set_phase ~clear_item:false "loop-synthesize";
     let fixed_aids = InterpJoinCore.compute_fixed_abs_ids ctx fp_ctx in
     let fixed_dids = ctx_get_dummy_var_ids ctx in
     eval_loop_symbolic_synthesize_loop_body config span eval_loop_body loop_id
