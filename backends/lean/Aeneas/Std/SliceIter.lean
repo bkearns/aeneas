@@ -124,6 +124,27 @@ impl_def core.iter.traits.iterator.IteratorSliceIter (T : Type _) :
     (core.iter.traits.iterator.IteratorSliceIter T)
 }
 
+/-- `Iterator::count` for `slice::Iter`.
+
+The standard library's `iterator!` macro defines `count` for the slice iterators
+(`library/core/src/slice/iter/macros.rs`):
+
+```rust
+#[inline]
+fn count(self) -> usize { len!(self) }
+```
+
+so the trait's provided body is overridden here and the call does not name the trait's default.
+`len!(self)` is the number of elements between `ptr` and `end`, which is what the trait's loop over
+`IteratorSliceIter.next` counts; modelling it as that loop keeps a single definition of counting in
+the model and makes the two definitions comparable, rather than restating the arithmetic of the
+pointer pair. -/
+@[rust_fun
+  "core::slice::iter::{core::iter::traits::iterator::Iterator<core::slice::iter::Iter<'a, @T>, &'a @T>}::count"]
+def core.slice.iter.IteratorSliceIter.count
+  {T : Type _} : core.slice.iter.Iter T → Result Usize :=
+  (core.iter.traits.iterator.IteratorSliceIter T).count
+
 -- ============================================================================
 -- IntoIterator for shared array references: &[T; N] → Iter<T>
 -- ============================================================================
@@ -372,6 +393,55 @@ private def collectNestedStepBy
     (mkSliceIter [0, 1, 2, 3, 4, 5, 6, 7]) 2#usize
   let sbi2 ← core.iter.traits.iterator.Iterator.step_by.default sbi 2#usize
   collectNestedStepBy sbi2).reducesTo [0, 4]
+
+-- ============================================================================
+-- `Iterator::count` tests
+-- ============================================================================
+
+/-- A dictionary that sets `next` and nothing else, so `count` comes from the field's default: the
+trait's loop over this `next`. Its state is the number of elements left. -/
+private def countDown : core.iter.traits.iterator.Iterator Nat Nat where
+  next := fun k => .ok (if k = 0 then none else some k, k - 1)
+
+-- The default of the `count` field is the loop over `next`: 0, 1 and many elements
+#guard (countDown.count 0).reducesTo 0#usize
+#guard (countDown.count 1).reducesTo 1#usize
+#guard (countDown.count 4).reducesTo 4#usize
+
+-- `slice::Iter` over an empty slice counts 0
+#guard ((core.iter.traits.iterator.IteratorSliceIter Nat).count (mkSliceIter [])).reducesTo
+  0#usize
+
+-- `slice::Iter` over one element counts 1
+#guard ((core.iter.traits.iterator.IteratorSliceIter Nat).count (mkSliceIter [42])).reducesTo
+  1#usize
+
+-- `slice::Iter` over many elements counts them all
+#guard ((core.iter.traits.iterator.IteratorSliceIter Nat).count
+  (mkSliceIter [1, 2, 3, 4, 5])).reducesTo 5#usize
+
+-- A partly consumed `slice::Iter` counts what is left: two of three
+#guard (do
+  let (_, it) ← core.slice.iter.IteratorSliceIter.next (mkSliceIter [1, 2, 3])
+  (core.iter.traits.iterator.IteratorSliceIter Nat).count it).reducesTo 2#usize
+
+-- The same through the trait default, which is the entry the translator calls
+#guard (core.iter.traits.iterator.Iterator.count.trait_default
+  (core.iter.traits.iterator.IteratorSliceIter Nat) (mkSliceIter [1, 2, 3])).reducesTo 3#usize
+
+-- A `Range` counts `end - start`, including the empty and one-element ranges
+#guard ((core.iter.range.IteratorRange.count core.iter.range.StepU32)
+  { start := 7#u32, «end» := 7#u32 }).reducesTo 0#usize
+#guard ((core.iter.range.IteratorRange.count core.iter.range.StepU32)
+  { start := 6#u32, «end» := 7#u32 }).reducesTo 1#usize
+#guard ((core.iter.range.IteratorRange.count core.iter.range.StepU32)
+  { start := 2#u32, «end» := 9#u32 }).reducesTo 7#usize
+
+-- And the trait default agrees with it
+#guard (core.iter.traits.iterator.Iterator.count.trait_default
+  (core.iter.traits.iterator.IteratorRange core.iter.range.StepU32)
+  { start := 2#u32, «end» := 9#u32 }).reducesTo 7#usize
+
 
 -- ============================================================================
 -- Step specs for SharedArray.into_iter and SharedSlice.into_iter

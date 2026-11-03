@@ -82,10 +82,66 @@ def core.iter.traits.iterator.Iterator.take.default
   Result (core.iter.adapters.take.Take Self) :=
   .ok ⟨ self, n ⟩
 
+/-! ## `Iterator::count`
+
+`count` is a provided method of the trait — its body is `self.fold(0, |n, _| n + 1)` — so it is
+neither declared by an implementation nor part of the crate being translated. A call through a
+generic `I: Iterator` is therefore a projection of the iterator dictionary, which means the model
+of the `Iterator` structure has to carry it, and a call on a concrete iterator type resolves to
+the trait's default body (or to the implementation's own override, which `count` has for slices).
+
+The loop advances `next` until it yields `none`, so it is not structurally recursive on the
+iterator and it does not terminate on an infinite iterator. The model takes the number of steps as
+*fuel*: after `fuel` calls to `next` it stops and reports what it counted. `count` below runs it
+with `Usize.max` as the fuel, i.e. with as many steps as the result itself could represent, so the
+value is the one Rust computes whenever Rust's own loop terminates at all (a longer run would
+overflow `usize`). -/
+def core.iter.traits.iterator.Iterator.count.loop
+  {Self Item : Type _} (next : Self → Result (Option Item × Self)) :
+  Nat → Self → Result Usize
+  | 0, _ => .ok 0#usize
+  | fuel + 1, self => do
+    let (opt, self) ← next self
+    match opt with
+    | none => .ok 0#usize
+    | some _ => do
+      let c ←
+        core.iter.traits.iterator.Iterator.count.loop next fuel self
+      c + 1#usize
+
+/-- `count` on `fuel = 0` did not look at the iterator: it is the base case of the loop, stated
+separately because the loop is a `Nat` match and its equation lemmas are what a proof about a
+concrete iterator unrolls with. -/
+@[simp]
+theorem core.iter.traits.iterator.Iterator.count.loop_zero
+  {Self Item : Type _} (next : Self → Result (Option Item × Self)) (self : Self) :
+  core.iter.traits.iterator.Iterator.count.loop next 0 self = .ok 0#usize := rfl
+
+/-- One step of the loop, in the shape a proof about a concrete iterator wants: `count` of a
+dictionary is the trait's loop over that dictionary's `next`. -/
+@[simp]
+theorem core.iter.traits.iterator.Iterator.count.loop_succ
+  {Self Item : Type _} (next : Self → Result (Option Item × Self))
+  (fuel : Nat) (self : Self) :
+  core.iter.traits.iterator.Iterator.count.loop next (fuel + 1) self =
+    (do
+      let (opt, self) ← next self
+      match opt with
+      | none => .ok 0#usize
+      | some _ => do
+        let c ← core.iter.traits.iterator.Iterator.count.loop next fuel self
+        c + 1#usize) := rfl
+
 @[rust_trait "core::iter::traits::iterator::Iterator"]
 structure core.iter.traits.iterator.Iterator (Self : Type _) (Self_Item : Type _)
   where
   next : Self → Result ((Option Self_Item) × Self)
+  /- `count` is a provided method, so the dictionary carries it rather than an implementation.
+     Its default is the trait's own loop over the `next` above, with the largest fuel the result
+     can represent; an implementation that overrides `count` (the slice iterators do, with
+     `len!(self)`) sets the field itself. -/
+  count : Self → Result Usize :=
+    fun self => core.iter.traits.iterator.Iterator.count.loop next Usize.max self
   step_by : Self → Usize → Result (core.iter.adapters.step_by.StepBy Self) := core.iter.traits.iterator.Iterator.step_by.default
   enumerate : Self → Result (core.iter.adapters.enumerate.Enumerate Self) := core.iter.traits.iterator.Iterator.enumerate.default
   take : Self → Usize → Result (core.iter.adapters.take.Take Self) := core.iter.traits.iterator.Iterator.take.default
@@ -96,6 +152,22 @@ structure core.iter.traits.iterator.Iterator (Self : Type _) (Self_Item : Type _
   -- `Iterator` to `SimpleIterator`.
   -- rev : Self → Result (core.iter.adapters.rev.Rev Self) -- this leads to a circularity
   -- TODO: collect
+
+/-- The trait's default body for `count`, over an explicit dictionary. The `Iterator::count` entry
+of the model table names `count.trait_default`, because that is the shape the translator emits for
+a call to a provided method. -/
+def core.iter.traits.iterator.Iterator.count.default
+  {Self Item : Type _}
+  (_IteratorInst : core.iter.traits.iterator.Iterator Self Item) :
+  Self → Result Usize :=
+  fun self => core.iter.traits.iterator.Iterator.count.loop _IteratorInst.next Usize.max self
+
+@[trait_default, rust_fun "core::iter::traits::iterator::Iterator::count"]
+def core.iter.traits.iterator.Iterator.count.trait_default
+  {Self Item : Type _}
+  (IteratorInst : core.iter.traits.iterator.Iterator Self Item)
+  (self : Self) : Result Usize :=
+  core.iter.traits.iterator.Iterator.count.default IteratorInst self
 
 @[trait_default, rust_fun "core::iter::traits::iterator::Iterator::step_by"]
 def core.iter.traits.iterator.Iterator.step_by.trait_default
@@ -620,6 +692,19 @@ impl_def core.iter.traits.iterator.IteratorRange {A : Type _}
   take := core.iter.traits.iterator.Iterator.take.trait_default
     (core.iter.traits.iterator.IteratorRange StepInst)
 }
+
+/-- `Iterator::count` for `Range`.
+
+The standard library does not override `count` for ranges, so the Rust call resolves to the
+trait's provided body; the translator still emits it as the *implementation's* method, which is
+why this path needs a model of its own. It is the trait's loop over this implementation's `next`,
+so there is one definition of counting in the model, not one per iterator. -/
+@[rust_fun
+  "core::iter::range::{core::iter::traits::iterator::Iterator<core::ops::range::Range<@A>, @A>}::count"]
+def core.iter.range.IteratorRange.count
+  {A : Type _} (StepInst : core.iter.range.Step A) :
+  core.ops.range.Range A → Result Usize :=
+  (core.iter.traits.iterator.IteratorRange StepInst).count
 
 /-- `Zip<A, B>::next` (default `ZipImpl::next`, `zip.rs:164-168`):
     ```rust
