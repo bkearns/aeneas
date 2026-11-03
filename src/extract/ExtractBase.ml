@@ -2041,12 +2041,35 @@ let ctx_compute_trait_impl_name_raw (ctx : extraction_ctx)
                       name_with_generics_to_simple_name ctx.trans_ctx name
                         params generics
                       |> flatten_name)
-              | _ ->
+              (* A function item used as a type -- an enum's variant constructor is
+                 a value of function type, and its [FnOnce] impl's self type is
+                 that item, not the enum. It has no declaration to name it, so the
+                 pattern fallback below names it with an anonymous variable, which
+                 is the same "P" for every such item: two constructors' impls then
+                 collapse onto one Lean name and the second is a duplicate
+                 declaration. Name it after the function it denotes, which is the
+                 thing that distinguishes two function items. *)
+              | TFnDef { binder_value = { kind = T.Fun fid; generics }; _ } -> (
+                  match FunDeclId.Map.find_opt fid ctx.crate.fun_decls with
+                  | None ->
+                      [%save_error] span
+                        "Missing function declaration, probably because of an \
+                         error which happened before";
+                      "__UNKNOWN__" ^ FunDeclId.to_string fid
+                  | Some decl ->
+                      let name =
+                        opt_ctx_prepare_name decl.item_meta ctx
+                          decl.item_meta.name
+                      in
+                      name_with_generics_to_simple_name ctx.trans_ctx name params
+                        generics
+                      |> flatten_name)
+              | _ -> (
                   let name =
                     NameMatcher.ty_to_pattern nm_ctx
                       ExtractName.default_to_pat_config trait_impl.generics self
                   in
-                  name_matcher_expr_to_simple_name (Some span) name
+                  name_matcher_expr_to_simple_name (Some span) name)
             in
 
             (* Generate the name for the trait *)
