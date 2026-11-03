@@ -52,15 +52,61 @@ let format_error_message_with_file_line (file : string) (line : int)
   format_error_message span msg
   ^ "\nCompiler source: " ^ file ^ ", line " ^ string_of_int line
 
+(* The declaration a failure happened in, when the raising code knows it. A failure that
+   escapes every per-item handler would otherwise be reported as a bare exception with
+   nothing to go on: the OCaml runtime prints [CFailure(_)] for a payload it has no printer
+   for, so the log named no construct at all. *)
+let current_item_key = Domain.DLS.new_key (fun () -> None)
+
+let current_item () : string option = Domain.DLS.get current_item_key
+
+(** Run [f] with the declaration under translation recorded, so a failure raised inside it
+    carries the name. Domain-local: functions are translated in parallel, and a shared cell
+    would report another worker's declaration. *)
+let with_current_item (name : string) (f : unit -> 'a) : 'a =
+  let previous = Domain.DLS.get current_item_key in
+  Domain.DLS.set current_item_key (Some name);
+  Fun.protect
+    ~finally:(fun () -> Domain.DLS.set current_item_key previous)
+    f
+
 type cfailure = {
   span : Meta.span option;
   file : string;
   line : int;
   msg : string;
+  item : string option;
+      (* The declaration being translated, captured when the failure is raised: the
+         handlers unwind before the run is reported, so a cell read at reporting time
+         would already be empty. *)
 }
 [@@deriving show]
 
 exception CFailure of cfailure
+
+(** The report printed for a [CFailure] that reaches the top level -- both when a handler
+    reports it and when it escapes every handler and the runtime prints it. The payload was
+    never shown before: an unregistered exception argument prints as [_], so an aborted run
+    said [Fatal error: exception Aeneas.Errors.CFailure(_)] beside "please file an issue"
+    without naming the construct, the source span, or the declaration. *)
+let cfailure_to_string (error : cfailure) : string =
+  let item =
+    match error.item with
+    | None -> ""
+    | Some name -> "\nWhile translating: " ^ name
+  in
+  let emitter =
+    if !Config.print_error_emitters then
+      "\nCompiler source: " ^ error.file ^ ", line " ^ string_of_int error.line
+    else ""
+  in
+  format_error_message error.span error.msg ^ item ^ emitter
+
+(* So the payload survives even the paths that do not catch [CFailure] themselves. *)
+let () =
+  Printexc.register_printer (function
+    | CFailure error -> Some (cfailure_to_string error)
+    | _ -> None)
 
 (** Recoverable failure *)
 exception RFailure
@@ -124,7 +170,7 @@ let craise_opt_span (file : string) (line : int) (span : Meta.span option)
     raise (Failure msg))
   else
     let () = push_error file line span msg in
-    raise (CFailure { span; file; line; msg })
+    raise (CFailure { span; file; line; msg; item = current_item () })
 
 let craise (file : string) (line : int) (span : Meta.span) (msg : string) =
   craise_opt_span file line (Some span) msg
@@ -135,7 +181,7 @@ let craise_opt_span_silent (file : string) (line : int)
   if !Config.fail_hard then
     let msg = format_error_message_with_file_line file line span msg in
     raise (Failure msg)
-  else raise (CFailure { span; file; line; msg })
+  else raise (CFailure { span; file; line; msg; item = current_item () })
 
 let craise_silent (file : string) (line : int) (span : Meta.span) (msg : string)
     =

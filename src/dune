@@ -257,3 +257,23 @@
  (alias runtest)
  (action
   (run ./test_trait_types.exe)))
+
+(executable
+ (name test_cfailure)
+ (modules Test_cfailure)
+ (libraries aeneas))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_cfailure.exe)))
+
+(executable
+ (name test_instantiation_arity)
+ (modules Test_instantiation_arity)
+ (libraries aeneas))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_instantiation_arity.exe)))
