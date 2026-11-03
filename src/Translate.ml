@@ -1233,6 +1233,19 @@ let extract_definitions (fmt : Format.formatter) (config : gen_config)
   let group_plan (ids : TraitDeclId.id list) : Trait_encoding.plan =
     if Config.backend () <> Lean then Trait_encoding.Plain
     else
+      (* A model-provided trait is not printed: [export_trait_decl] skips it and
+         the Lean library declares it, with the parameter list that library
+         chose. Extending it with a sister parameter -- which is what being
+         parameterized means -- therefore produces a use site that applies a
+         two-parameter structure to three arguments ("Function expected at
+         core.iter.traits.collect.FromIterator V T"). The group is planned over
+         the traits this run actually declares; a builtin member is named the way
+         the model names it, with no extra parameters. *)
+      let is_model_trait (id : TraitDeclId.id) : bool =
+        Option.is_some (TraitDeclId.Map.find_opt id ctx.trans_trait_decls)
+        && trait_decl_is_builtin ctx id
+      in
+      let ids = List.filter (fun id -> not (is_model_trait id)) ids in
       let group_names = List.filter_map trait_name_of ids in
       let members =
         List.filter_map
