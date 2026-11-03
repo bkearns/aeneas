@@ -2772,6 +2772,24 @@ let extract_trait_decl_register_parent_clause_names (ctx : extraction_ctx)
           (fun (c, name) -> (c.clause_id, name))
           (List.combine trait_decl.parent_clauses info.parent_clauses)
   in
+  (* Two clauses of the same parent trait applied to different [Self] types are legal in Rust
+     ([NonZeroInner : Copy] alongside its own [Copy]) and both need a field. The Lean name is a
+     field name, so it has to be unique within the structure; duplicate it and Lean rejects the
+     whole declaration with "Field `x` has already been declared". Suffix the repeats in
+     declaration order, which keeps the first clause's name stable for existing references. *)
+  let disambiguate names =
+    let seen = Hashtbl.create 8 in
+    List.map
+      (fun (cid, name) ->
+        let count =
+          match Hashtbl.find_opt seen name with Some n -> n | None -> 0
+        in
+        Hashtbl.replace seen name (count + 1);
+        if count = 0 then (cid, name)
+        else (cid, name ^ "_" ^ string_of_int count))
+      names
+  in
+  let clause_names = disambiguate clause_names in
   (* Register the names *)
   List.fold_left
     (fun ctx (cid, cname) ->
