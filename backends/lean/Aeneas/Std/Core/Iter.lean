@@ -1,5 +1,6 @@
 module
 public import Aeneas.Std.Core.Cmp
+public import Aeneas.Std.Core.Ops
 public import Aeneas.Std.Primitives
 public import Aeneas.Std.Range
 public import Aeneas.Std.Scalar.Core
@@ -66,6 +67,19 @@ structure core.iter.adapters.zip.Zip (A : Type u) (B : Type v) where
   fst : A
   snd : B
 
+@[rust_type "core::iter::adapters::map::Map"]
+structure core.iter.adapters.map.Map (I : Type u) (F : Type v) where
+  iter : I
+  f : F
+
+/-- Default for a method this model does not implement. It fails rather than returning a value,
+    so a translated body that uses an unmodelled method reports a panic instead of a wrong answer,
+    and the field still exists so an `Iterator` dictionary built anywhere type-checks. -/
+def core.iter.traits.iterator.Iterator.map.placeholder
+  {Self Item U F : Type _} (f : core.ops.function.FnMut F Item U) (self : Self) :
+  Result (core.iter.adapters.map.Map Self F) :=
+  .fail .panic
+
 def core.iter.traits.iterator.Iterator.step_by.default
   {Self : Type _} (self: Self) (step_by : Std.Usize) :
   Result (core.iter.adapters.step_by.StepBy Self) :=
@@ -89,6 +103,16 @@ structure core.iter.traits.iterator.Iterator (Self : Type _) (Self_Item : Type _
   step_by : Self → Usize → Result (core.iter.adapters.step_by.StepBy Self) := core.iter.traits.iterator.Iterator.step_by.default
   enumerate : Self → Result (core.iter.adapters.enumerate.Enumerate Self) := core.iter.traits.iterator.Iterator.enumerate.default
   take : Self → Usize → Result (core.iter.adapters.take.Take Self) := core.iter.traits.iterator.Iterator.take.default
+  /- Aeneas prints every method of the trait when it builds an `Iterator` dictionary, so a method
+     the model omits makes the dictionary literal mention a field the structure does not have
+     ("`map` is not a field of structure ..."), and the whole module fails. The methods below are
+     carried so an implementation type-checks; the ones with no model default say so explicitly
+     by failing rather than by faking a result. -/
+  map : ∀ {U F : Type}, core.ops.function.FnMut F Self_Item U → Self →
+    Result (core.iter.adapters.map.Map Self F) :=
+    core.iter.traits.iterator.Iterator.map.placeholder
+  -- `collect` stays unmodelled: its argument type `FromIterator` names `IntoIterator`, which
+  -- names `Iterator`, so giving it a field here is a type-level cycle (the model's own TODO).
   -- TODO: adding more fields like rev leads to a circularity.
   -- As an approximation we could only require these methods to implement a smaller version of
   -- `Iterator` with, e.g., only the `next` method. Most implementations should satisfy this
@@ -96,6 +120,19 @@ structure core.iter.traits.iterator.Iterator (Self : Type _) (Self_Item : Type _
   -- `Iterator` to `SimpleIterator`.
   -- rev : Self → Result (core.iter.adapters.rev.Rev Self) -- this leads to a circularity
   -- TODO: collect
+
+def core.iter.traits.iterator.Iterator.map.default
+  {Self Item : Type _} (inst : core.iter.traits.iterator.Iterator Self Item)
+  {U F : Type _} (f : core.ops.function.FnMut F Item U) :
+  Self → Result (core.iter.adapters.map.Map Self F) :=
+  inst.map f
+
+@[trait_default, rust_fun "core::iter::traits::iterator::Iterator::map"]
+def core.iter.traits.iterator.Iterator.map.trait_default
+  {Self Item : Type _} (_IteratorInst : core.iter.traits.iterator.Iterator Self Item)
+  {U F : Type _} (f : core.ops.function.FnMut F Item U) (self : Self) :
+  Result (core.iter.adapters.map.Map Self F) :=
+  _IteratorInst.map f self
 
 @[trait_default, rust_fun "core::iter::traits::iterator::Iterator::step_by"]
 def core.iter.traits.iterator.Iterator.step_by.trait_default
@@ -893,7 +930,4 @@ def core.ops.range.RangeInclusive.Insts.CoreIterTraitsDoubleEndedIterator.next_b
       let n ← StepInst.cloneInst.clone self.end
       ok (some n, ⟨self.start, self.«end», true⟩)
 
-@[rust_type "core::iter::adapters::map::Map"]
-structure core.iter.adapters.map.Map (I : Type u) (F : Type v) where
-  iter : I
-  f : F
+
