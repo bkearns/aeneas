@@ -2,20 +2,87 @@ open Types
 open Utils
 include Charon.TypesUtils
 
-let constant_expr_as_literal (c : constant_expr) : Values.literal =
+(** Describe the shape of a constant expression, without needing a formatting
+    context.
+
+    Error messages about constants should say what we got, not only what we
+    wanted. This description is deliberately context-free: the callers that
+    discover a non-primitive constant are in the middle of translating a body,
+    and the shape alone (kind plus sizes) is what tells the reader whether the
+    constant is a legitimate aggregate, a pointer, or an opaque value. *)
+let constant_expr_kind_desc (kind : constant_expr_kind) : string =
+  match kind with
+  | CBool _ -> "a boolean literal"
+  | CInteger _ -> "an integer literal"
+  | CChar _ -> "a character literal"
+  | CFloat _ -> "a float literal"
+  | CStr _ -> "a string literal"
+  | CByteStr bytes ->
+      Printf.sprintf "a byte-string literal of %d byte(s)" (List.length bytes)
+  | CAdt (variant_id, fields) ->
+      let what =
+        match variant_id with
+        | None -> "an aggregate value (struct, tuple or single-variant enum)"
+        | Some variant_id ->
+            "an aggregate value of variant " ^ VariantId.to_string variant_id
+      in
+      Printf.sprintf "%s with %d field(s)" what (List.length fields)
+  | CArray elements ->
+      Printf.sprintf "an array value with %d element(s)" (List.length elements)
+  | CRepeat _ -> "a repeated array value"
+  | CRef _ -> "a reference to a global place"
+  | CPtr _ -> "a raw pointer to a global place"
+  | CFnDef _ -> "a function definition (the unique value of a function item)"
+  | CFnPtr _ -> "a function pointer"
+  | CCast _ -> "a cast"
+  | CPtrNoProvenance _ -> "a pointer without provenance"
+  | CExternSymbol symbol ->
+      "the address of the external symbol '" ^ symbol ^ "'"
+  | CTypeId _ -> "a type id"
+  | CRawMemory bytes ->
+      Printf.sprintf "raw memory of %d byte(s)" (List.length bytes)
+  | CVar _ -> "a const generic variable"
+  | CGlobal _ -> "the value of another global"
+  | CCall _ -> "a call to an initializer function"
+  | CTraitConst _ -> "a trait associated constant"
+  | CVTableRef _ -> "the vtable of a trait implementation"
+  | CDiscriminant _ -> "the discriminant of an enum variant"
+  | CSizeOf _ -> "a size_of"
+  | CAlignOf _ -> "an align_of"
+  | COffsetOf _ -> "an offset_of"
+  | COpaque reason -> "an opaque constant (" ^ reason ^ ")"
+
+(** The literal value of a constant expression, if it has one.
+
+    Only literals fit in {!Values.literal}, so aggregates, pointers, function
+    items and the like are reported as [None] rather than turned into a
+    placeholder. Callers know which item they are translating and raise a
+    located error naming it. *)
+let constant_expr_as_literal_opt (c : constant_expr) : Values.literal option =
   match c.kind with
-  | CBool v -> VBool v
-  | CInteger v -> VScalar v
-  | CChar v -> VChar v
-  | CFloat v -> VFloat v
-  | CStr v -> VStr v
-  | CByteStr v -> VByteStr v
-  | _ -> raise (Failure "Expected a primitive constant")
+  | CBool v -> Some (VBool v)
+  | CInteger v -> Some (VScalar v)
+  | CChar v -> Some (VChar v)
+  | CFloat v -> Some (VFloat v)
+  | CStr v -> Some (VStr v)
+  | CByteStr v -> Some (VByteStr v)
+  (* Everything else is a shape [Values.literal] cannot hold. Listed one by one
+     rather than matched with a wildcard, so that a kind added on the Charon side
+     forces a decision here instead of silently becoming "not a literal". *)
+  | CAdt _ | CArray _ | CRepeat _ | CRef _ | CPtr _ | CFnDef _ | CFnPtr _
+  | CCast _ | CPtrNoProvenance _ | CExternSymbol _ | CTypeId _ | CRawMemory _
+  | CVar _ | CGlobal _ | CCall _ | CTraitConst _ | CVTableRef _ | CDiscriminant _
+  | CSizeOf _ | CAlignOf _ | COffsetOf _ | COpaque _ ->
+      None
 
 let constant_expr_as_integer (c : constant_expr) : integer_value =
   match c.kind with
   | CInteger v -> v
-  | _ -> raise (Failure "Expected an integer constant")
+  | _ ->
+      raise
+        (Failure
+           ("Expected an integer constant, got "
+           ^ constant_expr_kind_desc c.kind))
 
 (** Create a tuple type. *)
 let mk_tuple_ty (tys : ty list) : ty =

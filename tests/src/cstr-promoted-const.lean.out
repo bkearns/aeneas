@@ -1,0 +1,5 @@
+[[92mInfo[39m ] Imported: tests/llbc/cstr_promoted_const.llbc
+[[91mError[39m] The value of global 'cstr_promoted_const::first_byte::{promoted_const}' is not a primitive constant: we got an aggregate value (struct, tuple or single-variant enum) with 1 field(s) of type 'core::ffi::c_str::CStr', which this translator cannot turn into a value
+Source: 'tests/src/cstr-promoted-const.rs', lines 11:19-11:25
+Compiler source: interp/InterpStatements.ml, line 645
+
