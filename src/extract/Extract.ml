@@ -2564,7 +2564,15 @@ let extract_global_decl_body_gen (span : Meta.span) (ctx : extraction_ctx)
   (* Close "TYPE" box (depth=3) *)
   F.pp_close_box fmt ();
 
-  if not is_opaque then (
+  if is_opaque then (
+    (* Lean only, as for function declarations above: `def x : T` with no `:=` does not parse --
+       Lean reads the next item's doc comment as the body, which surfaces as
+       "unexpected token '/--'; expected ':=', 'where' or '|'" hundreds of lines away, pointing at
+       an innocent declaration. An unmodelled constant is a hole a completeness check can find. *)
+    if backend () = Lean then (
+      F.pp_print_space fmt ();
+      F.pp_print_string fmt ":= sorry"))
+  else (
     (* Print " =" *)
     F.pp_print_space fmt ();
     let eq =
