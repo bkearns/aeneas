@@ -399,9 +399,17 @@ let eval_operand_no_reorganize (config : config) (span : Meta.span)
       | CBool _ | CInteger _ | CChar _ | CFloat _ -> (
           [%ldebug "scalar constant"];
           match cv.ty with
-          | TScalar lit_ty ->
-              let lit = TypesUtils.constant_expr_as_literal cv in
-              (literal_to_tvalue span lit_ty lit ctx, ctx, fun e -> e)
+          | TScalar lit_ty -> (
+              match TypesUtils.constant_expr_as_literal_opt cv with
+              | Some lit -> (literal_to_tvalue span lit_ty lit ctx, ctx, fun e -> e)
+              | None ->
+                  (* Unreachable: the kinds matched above are exactly the
+                     literal ones. Kept as a located error rather than an
+                     assertion so that a future kind added to the branch above
+                     names the value instead of aborting the run. *)
+                  [%craise] span
+                    ("This constant is not a literal: "
+                    ^ Print.EvalCtx.constant_expr_to_string ctx cv))
           | _ ->
               [%craise] span
                 ("Unsupported type for scalar constant: "

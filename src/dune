@@ -257,3 +257,13 @@
  (alias runtest)
  (action
   (run ./test_trait_types.exe)))
+
+(executable
+ (name test_constants)
+ (modules Test_constants)
+ (libraries aeneas str))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_constants.exe)))

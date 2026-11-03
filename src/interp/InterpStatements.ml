@@ -629,12 +629,27 @@ let eval_global_as_fresh_symbolic_value (span : Meta.span)
       let cc =
         match Charon.GAstUtils.init_fun_id_of_global global with
         | Some _ -> S.synthesize_global_eval gref sval
-        | None ->
-            (* The global has no initializer: its value is a constant *)
-            let value = VLiteral (constant_expr_as_literal global.value) in
-            fun e ->
-              SymbolicAst.IntroSymbolic
-                (ctx, None, sval, VaSingleValue { value; ty }, e)
+        | None -> (
+            (* The global has no initializer: its value is a constant. We can
+               only turn a literal into a value, so anything else (an
+               aggregate, a pointer, a function item, ...) has no
+               representation. Report the item and the shape it actually has:
+               this fails one function, not the whole run. *)
+            match TypesUtils.constant_expr_as_literal_opt global.value with
+            | Some value ->
+                let value = VLiteral value in
+                fun e ->
+                  SymbolicAst.IntroSymbolic
+                    (ctx, None, sval, VaSingleValue { value; ty }, e)
+            | None ->
+                [%craise] span
+                  ("The value of global '"
+                  ^ Print.EvalCtx.name_to_string ctx global.item_meta.name
+                  ^ "' is not a primitive constant: we got "
+                  ^ TypesUtils.constant_expr_kind_desc global.value.kind
+                  ^ " of type '"
+                  ^ Print.EvalCtx.ty_to_string ctx global.ty
+                  ^ "', which this translator cannot turn into a value"))
       in
       (ctx, mk_tvalue_from_symbolic_value sval, ty, cc)
 
