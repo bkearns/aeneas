@@ -440,6 +440,39 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
               (List.map (fun _ -> None) sg.inputs)
           in
           let back_tys = compute_back_tys_with_info dsg in
+          (* A backward function is a *component of the result*, so the callee's
+             declaration has to carry it. Aeneas computes and prints one for every
+             function it translates, from this very signature; a *model* function
+             is different in kind, because its declaration is hand-written in the
+             Lean library and fixed -- [core.option.Option.expect] is
+             [Option T → Str → Result T]. When instantiating a type parameter with
+             a mutable borrow turns a call into one that returns a backward
+             function, the model has no component to receive it:
+             [get_mut(&id).expect(..)] passes an [Option (&mut Group)] and asks for
+             [Group → Option Group] back, so the emitted pattern destructures a pair
+             out of a value that is not one ("expected a product type, got
+             Group"). No printer shape can bridge that -- the model would have to
+             declare the component -- so report the call as unsupported: the
+             function is then admitted, which is visible in the file, rather than
+             mistranslated. *)
+          (match (fid, back_tys) with
+          | Fun fid, _
+            when List.exists
+                   (function Some (_, ty) -> is_arrow_ty ty | None -> false)
+                   back_tys -> (
+              match FunDeclId.Map.find_opt fid ctx.fun_ctx.llbc_fun_decls with
+              | Some decl
+                when Option.is_some
+                       (match_name_find_opt decls_ctx decl.item_meta.name
+                          (ExtractBuiltin.builtin_funs_map ())) ->
+                  [%craise_opt_span] (Some ctx.span)
+                    ("Unimplemented: the call to '"
+                    ^ name_to_string ctx decl.item_meta.name
+                   ^ "' returns a backward function, but the function is modelled \
+                      in the Lean library, whose declaration has no component to \
+                      receive it")
+              | _ -> ())
+          | _ -> ());
           [%ltrace
             "back_tys:\n "
             ^ String.concat "\n"
