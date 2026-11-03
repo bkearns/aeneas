@@ -764,6 +764,13 @@ let export_type (fmt : Format.formatter) (config : gen_config) (ctx : gen_ctx)
   in
   if extract then (
     if extract_decl then (
+      (* A constructor field can mention a type aeneas does not translate, and
+         Lean needs the declaration of that type to come before the inductive
+         which uses it. The miss is only discovered by a name lookup, so we
+         resolve the declaration's types first, then print the declarations they
+         need. *)
+      ExtractBase.declare_untranslated_types_in_type_decl ctx def;
+      ExtractBase.flush_untranslated_type_decls fmt;
       Extract.extract_type_decl ctx fmt type_decl_group kind def;
       EmitJson.record_type_if_enabled ctx def);
     if extract_extra_info then
@@ -860,6 +867,10 @@ let export_types_group (fmt : Format.formatter) (config : gen_config)
         export_type_decl kind def)
       defs;
     Extract.end_type_decl_group fmt is_rec defs;
+    (* The enumerations which we extract with the tag model are structures, not
+       inductives: we emit their "constructors" as functions, right after the
+       group (they use the types of the group, which might be recursive). *)
+    Extract.extract_type_decl_wide_enum_constructors ctx fmt ids_set defs;
 
     (* Export the extra information (ex.: [Arguments] instructions in Coq) *)
     List.iteri
@@ -947,6 +958,11 @@ let export_functions_group_scc (fmt : Format.formatter) (config : gen_config)
         then
           Some
             (fun () ->
+              (* See {!ExtractBase.declare_untranslated_types_in_type_decl}: a
+                 signature or a body can mention a type aeneas does not
+                 translate, which must be declared before this function. *)
+              ExtractBase.declare_untranslated_types_in_fun_decl ctx def;
+              ExtractBase.flush_untranslated_type_decls fmt;
               Extract.extract_fun_decl ctx fmt kind has_decr_clause def;
               EmitJson.record_fun_if_enabled ctx def)
         else None)
@@ -1115,6 +1131,13 @@ let export_global (fmt : Format.formatter) (config : gen_config) (ctx : gen_ctx)
     export_fun_decls_scc fmt config ctx (trans.loops @ trans.bodies);
 
     let pure_global = GlobalDeclId.Map.find_opt id ctx.trans_globals in
+    (* See {!ExtractBase.declare_untranslated_types_in_type_decl}. *)
+    Option.iter
+      (fun (def : Pure.global_decl) ->
+        ExtractBase.declare_untranslated_types_in_ty None ctx def.ty;
+        ExtractBase.declare_untranslated_types_in_ty None ctx def.output_ty)
+      pure_global;
+    ExtractBase.flush_untranslated_type_decls fmt;
     Extract.extract_global_decl ctx fmt pure_global body config.interface;
     Option.iter (EmitJson.record_global_if_enabled ctx) pure_global)
 
@@ -1577,7 +1600,12 @@ let extract_definitions (fmt : Format.formatter) (config : gen_config)
       with CFailure _ ->
         (* An exception was raised: ignore it *)
         ())
-    (Option.get ctx.crate.declarations)
+    (Option.get ctx.crate.declarations);
+
+  (* Anything registered while printing the trait stubs above ([ctx_get] records the types it
+     cannot find) has nothing after it to precede, but keep it out of the placeholder path
+     anyway. *)
+  ExtractBase.flush_untranslated_type_decls fmt
 
 type extract_file_info = {
   filename : string;

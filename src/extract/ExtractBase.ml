@@ -446,47 +446,63 @@ let names_maps_add (id_to_string : id -> string) (id : id)
     let names_map = names_map_add id_to_string (id, span) name nm.names_map in
     { nm with strict_names_map; names_map }
 
-(* Types a crate names but does not carry. A placeholder in a *type* position is
-   not a hole a reader can find: Lean rejects the whole inductive that embeds it
-   and every later reference to that type becomes an unknown identifier, so one
-   missing declaration reads as a crate-wide failure. Declaring the name keeps it
-   one hole in the right place. *)
-let untranslated_type_names = ref StringSet.empty
-let untranslated_type_decls = ref []
+(** Types which aeneas does not translate (types from an external crate, or
+    types removed before extraction) have no name in the names maps, but a
+    constructor field can still mention one, so the printer has to put *some*
+    type there. It used to put a [sorry] placeholder, which is not an
+    identifier: Lean rejected the enclosing inductive ("contains universe level
+    metavariables") and every later mention of that type became an unknown
+    identifier.
 
-(* Names this run does declare. A lookup miss does not prove absence: under -split-files the
-   names are registered per module, so a type declared in another file of the same package (or
-   later in this one) misses the map here and would get a stub that collides with its own
-   declaration ("`X` has already been declared"). *)
-let declared_type_names = ref StringSet.empty
+    We instead invent a name for it (see {!lean_name_of_untranslated_type}) and
+    record it here, so that {!flush_untranslated_type_decls} can declare it
+    before the first declaration which uses it. A type aeneas does translate
+    never gets here: its lookup hits the names map. *)
+let untranslated_type_decl_names : string list ref = ref []
 
-let note_declared_type ~(name : string) : unit =
-  declared_type_names := StringSet.add name !declared_type_names
+let untranslated_type_decl_name_set : (string, unit) Hashtbl.t =
+  Hashtbl.create 32
 
-let register_untranslated_type ~(name : string) : bool =
-  if StringSet.mem name !untranslated_type_names then false
+(** Record that [name] needs a [def <name> : Type := sorry] declaration. Returns
+    [true] if it was not recorded before, which lets the caller report the
+    lookup miss only once. *)
+let register_untranslated_type (name : string) : bool =
+  if Hashtbl.mem untranslated_type_decl_name_set name then false
   else (
-    untranslated_type_names := StringSet.add name !untranslated_type_names;
-    untranslated_type_decls := name :: !untranslated_type_decls;
+    Hashtbl.add untranslated_type_decl_name_set name ();
+    untranslated_type_decl_names := name :: !untranslated_type_decl_names;
     true)
 
-(** [id_to_string] renders a type as ["type name: rustls::error::OtherError"];
-    the declared name is that path with [::] as [.]. *)
-let stub_name_of_type_error (err : string) : string option =
-  let prefix = "Could not find: type name: " in
-  let plen = String.length prefix in
-  if String.length err <= plen || String.sub err 0 plen <> prefix then None
-  else
-    let path = String.sub err plen (String.length err - plen) in
-    let parts =
-      String.split_on_char ':' path |> List.filter (fun s -> String.length s > 0)
-    in
-    if parts = [] then None else Some (String.concat "." parts)
+(** Print (once) the declarations recorded by {!register_untranslated_type}, in
+    the order the misses were found, and forget them.
+
+    Must be called right before a declaration is printed: Lean needs a name to
+    be defined before it is used, and a lookup miss is only discovered while
+    printing the declaration itself. The box/break sequence is the same as the
+    one the trait declaration stubs in [Translate.extract_definitions] use,
+    because printing onto the formatter by hand desynchronises it and silently
+    drops the blank lines between every later declaration. *)
+let flush_untranslated_type_decls (fmt : Format.formatter) : unit =
+  let names = List.rev !untranslated_type_decl_names in
+  if names <> [] then (
+    untranslated_type_decl_names := [];
+    List.iter
+      (fun name ->
+        Format.pp_open_hvbox fmt 0;
+        Format.pp_print_string fmt ("def " ^ name ^ " : Type := sorry");
+        Format.pp_close_box fmt ();
+        Format.pp_print_break fmt 0 0)
+      names)
 
 (** The [id_to_string] function to print nice debugging messages if there are
-    collisions *)
-let names_maps_get (span : Meta.span option) (id_to_string : id -> string)
-    (id : id) (nm : names_maps) : string =
+    collisions.
+
+    [untranslated_type_name] gives a name to a type aeneas does not translate
+    (see {!lean_name_of_untranslated_type}); it is [None] when the backend
+    cannot use one, in which case we keep the old placeholder. *)
+let names_maps_get ?(untranslated_type_name : (type_id -> string option) option)
+    (span : Meta.span option) (id_to_string : id -> string) (id : id)
+    (nm : names_maps) : string =
   (* We do not use the same name map if we allow/disallow collisions *)
   let _map_to_string (m : string IdMap.t) : string =
     "[\n"
@@ -512,20 +528,29 @@ let names_maps_get (span : Meta.span option) (id_to_string : id -> string)
     match IdMap.find_opt id m with
     | Some s -> s
     | None -> (
-        let err = "Could not find: " ^ id_to_string id in
-        [%save_error_opt_span] span err;
-        match backend () with
-        | Lean -> (
-            match id with
-            | TypeId _ -> (
-                match stub_name_of_type_error err with
-                | Some name when StringSet.mem name !declared_type_names -> name
-                | Some name ->
-                    ignore (register_untranslated_type ~name);
-                    name
-                | None -> "sorry /- " ^ err ^ "-/")
-            | _ -> "sorry /- " ^ err ^ "-/")
-        | _ -> "(ERROR: " ^ id_to_string id ^ ")")
+        match (id, untranslated_type_name) with
+        | TypeId tid, Some name_of -> (
+            (* A type aeneas does not translate: it gets a name of its own and a
+               declaration, so that it is usable in type position.
+
+               We keep reporting the miss, since it does mean a type is
+               missing, but only once per type: the lookup happens again every
+               time the type is printed. *)
+            match name_of tid with
+            | Some name ->
+                if register_untranslated_type name then
+                  [%save_error_opt_span] span
+                    ("Could not find: " ^ id_to_string id
+                   ^ " (aeneas does not translate it: declared as an opaque \
+                      type)");
+                name
+            | None -> "sorry /- Could not find: " ^ id_to_string id ^ "-/")
+        | _ -> (
+            let err = "Could not find: " ^ id_to_string id in
+            [%save_error_opt_span] span err;
+            match backend () with
+            | Lean -> "sorry /- " ^ err ^ "-/"
+            | _ -> "(ERROR: " ^ id_to_string id ^ ")"))
 
 (* Remember emitted names as well as pending ones so later uses cannot redeclare
    the same trait after a flush. *)
@@ -534,9 +559,7 @@ let untranslated_trait_decls = ref []
 
 let reset_untranslated_traits () : unit =
   untranslated_trait_names := StringSet.empty;
-  untranslated_trait_decls := [];
-  untranslated_type_names := StringSet.empty;
-  untranslated_type_decls := []
+  untranslated_trait_decls := []
 
 let register_untranslated_trait ~(name : string) ~(arity : int) : bool =
   if StringSet.mem name !untranslated_trait_names then false
@@ -546,16 +569,6 @@ let register_untranslated_trait ~(name : string) ~(arity : int) : bool =
     true)
 
 let flush_untranslated_trait_decls (fmt : F.formatter) : unit =
-  (* Types first: a stub trait's fields are types, and Lean has no forward
-     references. *)
-  List.iter
-    (fun name ->
-      F.pp_open_hvbox fmt 0;
-      F.pp_print_string fmt ("def " ^ name ^ " : Type := sorry");
-      F.pp_close_box fmt ();
-      F.pp_print_break fmt 0 0)
-    (List.rev !untranslated_type_decls);
-  untranslated_type_decls := [];
   List.iter
     (fun (name, arity) ->
       (* Keep the formatter synchronized with the surrounding declarations so
@@ -908,6 +921,42 @@ let escape_name ?(qualified : bool = false) (name : string) : string =
       String.concat "." (List.map escape_part parts)
   | FStar | Coq | HOL4 -> name
 
+(** The name we give, in Lean, to a type which aeneas does not translate.
+
+    [type_id_to_string] renders such a type as the Rust path it comes from
+    (["rustls::error::other_error::OtherError"]), and aeneas names a translated
+    type after that same path with ['.'] separators ([rustls.error.Error]), so
+    we derive one from the other rather than inventing an unrelated scheme: a
+    name which shows where the type comes from, and which the escaping we
+    already have can turn into a legal identifier.
+
+    Returns [None] when that path is empty ([TTuple]), which has no name to
+    derive anything sensible from. *)
+let lean_name_of_untranslated_type (ctx : extraction_ctx) (tid : type_id) :
+    string option =
+  let path = type_id_to_string ctx tid in
+  (* Keep the path only: generic arguments ([Foo<Bar>]) would need a
+     parameterised declaration, and the declaration we emit takes none. *)
+  let path =
+    match String.index_opt path '<' with
+    | Some i -> String.sub path 0 i
+    | None -> path
+  in
+  let component (s : string) : string =
+    String.map
+      (function
+        | ('a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' | '\'') as c -> c
+        | _ -> '_')
+      s
+  in
+  (* [type_id_to_string] separates the path components with ["::"]. *)
+  let components =
+    List.filter (fun s -> s <> "") (String.split_on_char ':' path)
+  in
+  match components with
+  | [] -> None
+  | _ -> Some (escape_name (String.concat "." (List.map component components)))
+
 let ctx_add (span : Meta.span) (id : id) (name : string) (ctx : extraction_ctx)
     : extraction_ctx =
   let id_to_string (id : id) : string = id_to_string (Some span) id ctx in
@@ -921,7 +970,13 @@ let ctx_add (span : Meta.span) (id : id) (name : string) (ctx : extraction_ctx)
 let ctx_get_raw (span : Meta.span option) (id : id) (ctx : extraction_ctx) :
     string =
   let id_to_string (id : id) : string = id_to_string span id ctx in
-  names_maps_get span id_to_string id ctx.names_maps
+  (* Only Lean uses the invented name: the other backends keep the placeholder
+     their own printers tolerate. *)
+  let untranslated_type_name =
+    if backend () = Lean then Some (lean_name_of_untranslated_type ctx)
+    else None
+  in
+  names_maps_get ?untranslated_type_name span id_to_string id ctx.names_maps
 
 (** Retrieve a name from the names maps, escaped if needed: the result is meant
     to be printed. See {!escape_name} for the meaning of [qualified]. *)
@@ -949,6 +1004,48 @@ let ctx_get_type (span : Meta.span option) (id : type_id) (ctx : extraction_ctx)
 let ctx_get_local_type (span : Meta.span) (id : TypeDeclId.id)
     (ctx : extraction_ctx) : string =
   ctx_get_type (Some span) (TAdtId id) ctx
+
+(** Force the name lookup of every type [ty] mentions.
+
+    A type which aeneas does not translate is only discovered by looking it up
+    (see {!untranslated_type_decl_names}); since the lookup happens while
+    printing, and Lean wants a declaration before its first use, we resolve the
+    types of a declaration *before* printing it. *)
+let declare_untranslated_types_in_ty (span : Meta.span option)
+    (ctx : extraction_ctx) (ty : ty) : unit =
+  let obj =
+    object
+      inherit [_] iter_ty as super
+
+      method! visit_TAdt env tid generics =
+        ignore (ctx_get span (TypeId tid) ctx);
+        super#visit_TAdt env tid generics
+    end
+  in
+  obj#visit_ty () ty
+
+(** See {!declare_untranslated_types_in_ty}. *)
+let declare_untranslated_types_in_type_decl (ctx : extraction_ctx)
+    (def : type_decl) : unit =
+  let span = Some def.item_meta.span in
+  let field_ty (f : field) = f.field_ty in
+  let tys =
+    match def.kind with
+    | Struct fields -> List.map field_ty fields
+    | Enum variants ->
+        List.concat_map
+          (fun (v : variant) -> List.map field_ty v.fields)
+          variants
+    | Opaque -> []
+  in
+  List.iter (declare_untranslated_types_in_ty span ctx) tys
+
+(** See {!declare_untranslated_types_in_ty}. *)
+let declare_untranslated_types_in_fun_decl (ctx : extraction_ctx)
+    (def : fun_decl) : unit =
+  let span = Some def.item_meta.span in
+  List.iter (declare_untranslated_types_in_ty span ctx) def.signature.inputs;
+  declare_untranslated_types_in_ty span ctx def.signature.output
 
 let ctx_get_builtin_type (span : Meta.span option) (id : builtin_ty)
     (ctx : extraction_ctx) : string =
@@ -1484,9 +1581,14 @@ let initialize_names_maps () : names_maps =
 
     For instance: "type", "and", etc.
 
+    [wide] is [{true}] for the Lean enumerations which we extract with the tag
+    model instead of as inductives (see {!WideEnum.is_wide_enum}), because Lean
+    rejects inductives with too many constructors: those are extracted as
+    structures.
+
     Remark: can return [None] for some backends like HOL4. *)
-let type_decl_kind_to_qualif (span : Meta.span) (kind : decl_kind)
-    (type_kind : type_decl_kind option) : string option =
+let type_decl_kind_to_qualif (span : Meta.span) ?(wide : bool = false)
+    (kind : decl_kind) (type_kind : type_decl_kind option) : string option =
   match backend () with
   | FStar -> (
       match kind with
@@ -1523,8 +1625,11 @@ let type_decl_kind_to_qualif (span : Meta.span) (kind : decl_kind)
           match type_kind with
           | Some Tuple -> Some "def"
           | Some Struct -> Some "structure"
+          (* Wide enums use the tag model: a structure with a [disc] field *)
+          | Some Enum when wide -> Some "structure"
           | _ -> Some "inductive")
-      | SingleRec | MutRecFirst | MutRecInner | MutRecLast -> Some "inductive"
+      | SingleRec | MutRecFirst | MutRecInner | MutRecLast ->
+          if wide then Some "structure" else Some "inductive"
       | Builtin -> Some "def"
       | Declared -> Some "def")
   | HOL4 -> None

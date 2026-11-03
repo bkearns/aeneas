@@ -129,7 +129,8 @@
   TypesUtils
   Utils
   Values
-  ValuesUtils))
+  ValuesUtils
+  WideEnum))
 
 ;; Embed the version into the binary so that `aeneas -version` can report it.
 ;; Follows the same pattern as opam (see https://github.com/ocaml/opam/blob/master/src/client/dune).
