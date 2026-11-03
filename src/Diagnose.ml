@@ -100,13 +100,14 @@ let current_item : string Atomic.t = Atomic.make ""
 let sample_line ~(elapsed : float) ~(phase : string) ~(item : string)
     ~(live_words : int) ~(heap_words : int) ~(top_heap_words : int)
     ~(minor_words : int) ~(major_collections : int) ~(steps : int) ~(env_len : int)
-    : string =
+    ~(env_vars : int) ~(env_dummies : int) ~(env_abs : int) : string =
   Printf.sprintf
     "stat t=%.1fs phase=%s live_words=%d live_mib=%.1f heap_words=%d heap_mib=%.1f \
-     top_heap_words=%d minor_words=%d major_collections=%d steps=%d env=%d item=%s"
+     top_heap_words=%d minor_words=%d major_collections=%d steps=%d env=%d vars=%d \
+     dummies=%d abs=%d item=%s"
     elapsed phase live_words (words_to_mib live_words) heap_words
     (words_to_mib heap_words) top_heap_words minor_words major_collections steps
-    env_len item
+    env_len env_vars env_dummies env_abs item
 
 let write_lock = Mutex.create ()
 
@@ -137,11 +138,17 @@ let append (line : string) : unit =
     evaluated and the next sample's live delta says what they cost. *)
 let steps : int Atomic.t = Atomic.make 0
 let env_len : int Atomic.t = Atomic.make 0
+let env_vars : int Atomic.t = Atomic.make 0
+let env_dummies : int Atomic.t = Atomic.make 0
+let env_abs : int Atomic.t = Atomic.make 0
 
-let bump ?(env = 0) () : unit =
+let bump ?(env = 0) ?(vars = 0) ?(dummies = 0) ?(abs = 0) () : unit =
   if sampling_enabled () then begin
     ignore (Atomic.fetch_and_add steps 1);
-    Atomic.set env_len env
+    Atomic.set env_len env;
+    Atomic.set env_vars vars;
+    Atomic.set env_dummies dummies;
+    Atomic.set env_abs abs
   end
 
 (** Write one sample now. Cheap when sampling is off. *)
@@ -155,7 +162,9 @@ let sample () : unit =
          ~top_heap_words:st.Gc.top_heap_words
          ~minor_words:(int_of_float st.Gc.minor_words)
          ~major_collections:st.Gc.major_collections
-         ~steps:(Atomic.get steps) ~env_len:(Atomic.get env_len))
+         ~steps:(Atomic.get steps) ~env_len:(Atomic.get env_len)
+         ~env_vars:(Atomic.get env_vars) ~env_dummies:(Atomic.get env_dummies)
+         ~env_abs:(Atomic.get env_abs))
 
 (** Enter a phase: record it immediately, so even a short phase names itself, then keep
     sampling. Every phase boundary is a sample, which is what makes a killed run's file

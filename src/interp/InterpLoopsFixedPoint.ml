@@ -152,9 +152,11 @@ let compute_loop_entry_fixed_point (config : config) (span : Meta.span)
   let rec compute_fixed_point (ctx : eval_ctx) (i0 : int) (i : int) : eval_ctx =
     if i = 0 then (
       [%ltrace
-        "Joined contexts:\n"
+        "Joined contexts (bounded to the last "
+        ^ string_of_int (List.length !joined_ctxs)
+        ^ "):\n"
         ^ String.concat "\n\n"
-            (List.map eval_ctx_to_string (List.rev !joined_ctxs))];
+            (List.map eval_ctx_to_string (Trace_ring.to_list !joined_ctxs))];
       [%craise] span
         ("Could not compute a loop fixed point in " ^ string_of_int i0
        ^ " iterations"))
@@ -219,7 +221,9 @@ let compute_loop_entry_fixed_point (config : config) (span : Meta.span)
       (* Check if we reached a fixed point: if not, iterate *)
       if equiv_ctxs i ctx ctx1 then ctx1
       else (
-        joined_ctxs := ctx1 :: !joined_ctxs;
+        (* Newest-first and bounded: a context holds a whole environment, so keeping
+           every one would make this search cost grow with its iteration count. *)
+        joined_ctxs := Trace_ring.push ctx1 !joined_ctxs;
         compute_fixed_point ctx1 i0 (i - 1))
   in
   let fp = compute_fixed_point ctx max_num_iter max_num_iter in

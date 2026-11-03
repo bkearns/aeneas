@@ -122,6 +122,7 @@
   SymbolicToPureTypes
   SymbolicToPureValues
   SynthesizeSymbolic
+  Trace_ring
   TranslateCore
   Translate
   Trait_encoding
@@ -308,3 +309,13 @@
  (alias runtest)
  (action
   (run ./test_mem_report.exe)))
+
+(executable
+ (name test_trace_ring)
+ (modules Test_trace_ring)
+ (libraries aeneas))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_trace_ring.exe)))

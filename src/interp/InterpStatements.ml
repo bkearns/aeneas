@@ -679,9 +679,25 @@ let statement_is_noop (st : statement) (ctx : eval_ctx) : bool =
       | Some _ -> false)
   | _ -> false
 
+(** One fold over the environment, for the sample line: how many of a context's bindings are
+    ordinary variables, drop stand-ins ([BDummy]), abstractions, and frame markers. The
+    split is what says why a context is as large as it is. *)
+let env_shape (ctx : eval_ctx) : int * int * int * int =
+  List.fold_left
+    (fun (n, vars, dummies, abs) (e : env_elem) ->
+      match e with
+      | EBinding (BVar _, _) -> (n + 1, vars + 1, dummies, abs)
+      | EBinding (BDummy _, _) -> (n + 1, vars, dummies + 1, abs)
+      | EAbs _ -> (n + 1, vars, dummies, abs + 1)
+      | EFrame -> (n + 1, vars, dummies, abs))
+    (0, 0, 0, 0) ctx.env
+
 let rec eval_statement (config : config) (st : statement) : stl_cm_fun =
  fun ctx ->
-  Diagnose.bump ~env:(List.length ctx.env) ();
+  if Diagnose.sampling_enabled () then begin
+    let env, vars, dummies, abs = env_shape ctx in
+    Diagnose.bump ~env ~vars ~dummies ~abs ()
+  end;
   if statement_is_noop st ctx then
     ([ (ctx, Unit) ], cf_singleton __FILE__ __LINE__ st.span)
   else begin
