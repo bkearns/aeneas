@@ -446,6 +446,34 @@ let names_maps_add (id_to_string : id -> string) (id : id)
     let names_map = names_map_add id_to_string (id, span) name nm.names_map in
     { nm with strict_names_map; names_map }
 
+(* Types a crate names but does not carry. A placeholder in a *type* position is
+   not a hole a reader can find: Lean rejects the whole inductive that embeds it
+   and every later reference to that type becomes an unknown identifier, so one
+   missing declaration reads as a crate-wide failure. Declaring the name keeps it
+   one hole in the right place. *)
+let untranslated_type_names = ref StringSet.empty
+let untranslated_type_decls = ref []
+
+let register_untranslated_type ~(name : string) : bool =
+  if StringSet.mem name !untranslated_type_names then false
+  else (
+    untranslated_type_names := StringSet.add name !untranslated_type_names;
+    untranslated_type_decls := name :: !untranslated_type_decls;
+    true)
+
+(** [id_to_string] renders a type as ["type name: rustls::error::OtherError"];
+    the declared name is that path with [::] as [.]. *)
+let stub_name_of_type_error (err : string) : string option =
+  let prefix = "Could not find: type name: " in
+  let plen = String.length prefix in
+  if String.length err <= plen || String.sub err 0 plen <> prefix then None
+  else
+    let path = String.sub err plen (String.length err - plen) in
+    let parts =
+      String.split_on_char ':' path |> List.filter (fun s -> String.length s > 0)
+    in
+    if parts = [] then None else Some (String.concat "." parts)
+
 (** The [id_to_string] function to print nice debugging messages if there are
     collisions *)
 let names_maps_get (span : Meta.span option) (id_to_string : id -> string)
@@ -478,7 +506,15 @@ let names_maps_get (span : Meta.span option) (id_to_string : id -> string)
         let err = "Could not find: " ^ id_to_string id in
         [%save_error_opt_span] span err;
         match backend () with
-        | Lean -> "sorry /- " ^ err ^ "-/"
+        | Lean -> (
+            match id with
+            | TypeId _ -> (
+                match stub_name_of_type_error err with
+                | Some name ->
+                    ignore (register_untranslated_type ~name);
+                    name
+                | None -> "sorry /- " ^ err ^ "-/")
+            | _ -> "sorry /- " ^ err ^ "-/")
         | _ -> "(ERROR: " ^ id_to_string id ^ ")")
 
 (* Remember emitted names as well as pending ones so later uses cannot redeclare
@@ -488,7 +524,9 @@ let untranslated_trait_decls = ref []
 
 let reset_untranslated_traits () : unit =
   untranslated_trait_names := StringSet.empty;
-  untranslated_trait_decls := []
+  untranslated_trait_decls := [];
+  untranslated_type_names := StringSet.empty;
+  untranslated_type_decls := []
 
 let register_untranslated_trait ~(name : string) ~(arity : int) : bool =
   if StringSet.mem name !untranslated_trait_names then false
@@ -498,6 +536,16 @@ let register_untranslated_trait ~(name : string) ~(arity : int) : bool =
     true)
 
 let flush_untranslated_trait_decls (fmt : F.formatter) : unit =
+  (* Types first: a stub trait's fields are types, and Lean has no forward
+     references. *)
+  List.iter
+    (fun name ->
+      F.pp_open_hvbox fmt 0;
+      F.pp_print_string fmt ("def " ^ name ^ " : Type := sorry");
+      F.pp_close_box fmt ();
+      F.pp_print_break fmt 0 0)
+    (List.rev !untranslated_type_decls);
+  untranslated_type_decls := [];
   List.iter
     (fun (name, arity) ->
       (* Keep the formatter synchronized with the surrounding declarations so
