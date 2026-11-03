@@ -123,7 +123,7 @@ let translate_function_to_pure_aux (trans_ctx : trans_ctx)
      the signature, but the body is translated through a separate entry point, so
      we check here too to cleanly skip the function rather than failing later when
      looking up its (untranslated) signature. *)
-  TypesAnalysis.check_fun_decl_no_bound_free_implied_bounds
+  TypesAnalysis.check_fun_decl_no_bound_free_implied_bounds trans_ctx.crate
     trans_ctx.type_ctx.type_decls fdef;
 
   (* Compute the symbolic ASTs, if the function is transparent *)
@@ -338,7 +338,11 @@ let translate_crate_to_pure (crate : crate) (marked_ids : marked_ids) :
         List.filter_map
           (fun (global : global_decl) ->
             try
-              let g = SymbolicToPure.translate_global trans_ctx global in
+              let g =
+                Errors.with_current_item
+                  (name_to_string trans_ctx global.item_meta.name)
+                  (fun () -> SymbolicToPure.translate_global trans_ctx global)
+              in
               report 1;
               Some g
             with CFailure error ->
@@ -534,8 +538,9 @@ let translate_crate_to_pure (crate : crate) (marked_ids : marked_ids) :
               if !Config.diagnose_memory then
                 Diagnose.log_running ~name ~live_words:live_before ~size ~rank;
               let f =
-                translate_function_to_pure trans_ctx marked_ids type_decls_map
-                  global_decls_map fun_sigs x
+                Errors.with_current_item name (fun () ->
+                    translate_function_to_pure trans_ctx marked_ids
+                      type_decls_map global_decls_map fun_sigs x)
               in
               if !Config.memory_limit_mb > 0 then begin
                 let live = (Gc.quick_stat ()).Gc.live_words in
@@ -604,9 +609,13 @@ let translate_crate_to_pure (crate : crate) (marked_ids : marked_ids) :
     ProgressBar.with_reporter num_decls "Translated trait declarations: "
       (fun report ->
         List.filter_map
-          (fun d ->
+          (fun (d : LlbcAst.trait_decl) ->
             try
-              let d = SymbolicToPure.translate_trait_decl trans_ctx d in
+              let d =
+                Errors.with_current_item
+                  (name_to_string trans_ctx d.item_meta.name)
+                  (fun () -> SymbolicToPure.translate_trait_decl trans_ctx d)
+              in
               report 1;
               Some d
             with CFailure error ->
@@ -636,9 +645,13 @@ let translate_crate_to_pure (crate : crate) (marked_ids : marked_ids) :
     ProgressBar.with_reporter num_decls "Translated trait impls: "
       (fun report ->
         List.filter_map
-          (fun d ->
+          (fun (d : LlbcAst.trait_impl) ->
             try
-              let d = SymbolicToPure.translate_trait_impl trans_ctx d in
+              let d =
+                Errors.with_current_item
+                  (name_to_string trans_ctx d.item_meta.name)
+                  (fun () -> SymbolicToPure.translate_trait_impl trans_ctx d)
+              in
               report 1;
               Some d
             with CFailure error ->

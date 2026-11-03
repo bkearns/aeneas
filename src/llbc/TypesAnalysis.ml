@@ -416,9 +416,9 @@ let analyze_full_ty (span : Meta.span option) (updated : bool ref)
            then explore the type *)
         (* [List.combine] raises [Invalid_argument] when a declaration's
            parameters and this instantiation disagree in length, and that
-           aborted the whole crate (ferrosa_graph). Report the disagreement and
-           explore the parameters both sides agree on: the pass stays
-           conservative rather than dying. *)
+           aborted the whole crate on a large graph crate. Report the
+           disagreement and explore the parameters both sides agree on: the
+           pass stays conservative rather than dying. *)
         let param_infos, param_tys =
           if List.length adt_info.param_infos <> List.length generics.types
           then begin
@@ -973,6 +973,42 @@ let compute_outlive_proj_ty (span : Meta.span option)
 
   outlive_regions
 
+(** The name of a type declaration, for a message. Charon's printer wants an environment
+    built from the whole crate, which this module does not have; the path is enough. *)
+let name_of_type_decl (crate : crate) (decl : type_decl) : string =
+  Charon.Print.name_to_string (Charon.Print.crate_to_fmt_env crate)
+    decl.item_meta.name
+
+(** The parameters on which a type declaration and one use of it disagree, one entry per
+    kind, e.g. ["type parameters: declared 2, instantiated with 1"].
+
+    Charon lifts every associated type named by a declaration's bounds into an extra type
+    parameter ([Clause0_Output] and the like), so a use of that declaration has to carry one
+    argument per parameter. A use that carries only the arguments the type declared -- one
+    taken from another crate's metadata is not lifted -- leaves the two lists of different
+    lengths. They are zipped by {!Charon.Substitute.make_subst_from_generics}, where
+    [List.combine] raises [Invalid_argument], so a single such use used to abort the whole
+    crate. Report the disagreement instead, naming both lengths and what they describe. *)
+let instantiation_arity_mismatches (params : generic_params)
+    (args : generic_args) : string list =
+  let compare what (n_decl : int) (n_use : int) : string option =
+    if n_decl = n_use then None
+    else
+      Some
+        (Printf.sprintf "%s: declared %d, instantiated with %d" what n_decl n_use)
+  in
+  List.filter_map Fun.id
+    [
+      compare "type parameters" (List.length params.types)
+        (List.length args.types);
+      compare "region parameters" (List.length params.regions)
+        (List.length args.regions);
+      compare "const generic parameters" (List.length params.const_generics)
+        (List.length args.const_generics);
+      compare "trait clauses" (List.length params.trait_clauses)
+        (List.length args.trait_refs);
+    ]
+
 (** Detect "implied bounds" that relate a locally-bound (higher-ranked) region
     to a free region, and reject such cases.
 
@@ -990,7 +1026,7 @@ let compute_outlive_proj_ty (span : Meta.span option)
       borrow must be shorter than (i.e. is outlived by) every lifetime appearing
       in the referent [T]. We track the borrow regions we have dived into to
       check these. *)
-let check_no_bound_free_implied_bounds (span : Meta.span option)
+let check_no_bound_free_implied_bounds (crate : crate) (span : Meta.span option)
     (type_decls : type_decl TypeDeclId.Map.t) (tys : ty list) : unit =
   let is_bound (r : region) =
     match r with
@@ -1047,26 +1083,44 @@ let check_no_bound_free_implied_bounds (span : Meta.span option)
             | None -> (
                 match TypeDeclId.Map.find_opt id type_decls with
                 | None -> ()
-                | Some decl ->
-                    let subst =
-                      Charon.Substitute.make_subst_from_generics decl.generics
-                        adt_generics Self
-                    in
-                    let preds =
-                      Charon.Substitute.predicates_substitute subst
-                        decl.generics
-                    in
-                    (* [RLub ty] outlives [r] when every region of [ty]
-                       outlives [r]. *)
-                    List.iter
-                      (fun (p : outlives_pred region_binder) ->
-                        match p.binder_value with
-                        | RLub ty, r ->
-                            List.iter
-                              (fun rt -> check_pair rt r)
-                              (regions_of_ty ty)
-                        | r0, r1 -> check_pair r0 r1)
-                      preds.outlives)
+                | Some decl -> (
+                    match
+                      instantiation_arity_mismatches decl.generics adt_generics
+                    with
+                    | _ :: _ as mismatches ->
+                        (* The declaration and this use of it do not describe the same
+                           parameters (see {!instantiation_arity_mismatches}), so there is
+                           no substitution to build: the lists [make_subst_from_generics]
+                           zips are the ones that disagree. Say which, and skip what the
+                           substitution was for -- the implied bounds this declaration
+                           contributes. The arguments are still visited below. *)
+                        [%save_error_opt_span] span
+                          (Printf.sprintf
+                             "Type declaration '%s' and this use of it disagree on their \
+                              parameters (%s); the bounds it implies are not checked \
+                              here"
+                             (name_of_type_decl crate decl)
+                             (String.concat ", " mismatches))
+                    | [] ->
+                        let subst =
+                          Charon.Substitute.make_subst_from_generics
+                            decl.generics adt_generics Self
+                        in
+                        let preds =
+                          Charon.Substitute.predicates_substitute subst
+                            decl.generics
+                        in
+                        (* [RLub ty] outlives [r] when every region of [ty]
+                           outlives [r]. *)
+                        List.iter
+                          (fun (p : outlives_pred region_binder) ->
+                            match p.binder_value with
+                            | RLub ty, r ->
+                                List.iter
+                                  (fun rt -> check_pair rt r)
+                                  (regions_of_ty ty)
+                            | r0, r1 -> check_pair r0 r1)
+                          preds.outlives))
             | _ -> ());
             (* Dive into the generic arguments. The region arguments are checked
                against [outer] by [visit_region], the type arguments are
@@ -1082,7 +1136,7 @@ let check_no_bound_free_implied_bounds (span : Meta.span option)
     {!check_no_bound_free_implied_bounds}). We look at the input/output types as
     well as the types appearing in the (possibly higher-ranked) trait clauses.
 *)
-let check_fun_decl_no_bound_free_implied_bounds
+let check_fun_decl_no_bound_free_implied_bounds (crate : crate)
     (type_decls : type_decl TypeDeclId.Map.t) (f : fun_decl) : unit =
   let span = Some f.item_meta.span in
   let ({ inputs; output; _ } : fun_sig) = f.signature in
@@ -1092,5 +1146,5 @@ let check_fun_decl_no_bound_free_implied_bounds
       (fun (c : trait_param) -> c.trait.binder_value.generics.types)
       f.generics.trait_clauses
   in
-  check_no_bound_free_implied_bounds span type_decls
+  check_no_bound_free_implied_bounds crate span type_decls
     ((output :: inputs) @ clause_tys)

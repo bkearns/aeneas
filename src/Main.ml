@@ -372,6 +372,16 @@ let () =
     fail false
   in
 
+  (* A failure no per-item handler caught aborts the run. Report it through the error
+     printer, which names the span, the message and the declaration, and stop: the
+     translation state was being mutated when it was raised, so there is nothing to finish.
+     Without this the runtime printed the exception's payload as [_] and the log named no
+     construct at all. *)
+  let fail_crate (error : Errors.cfailure) =
+    log#serror (Errors.cfailure_to_string error);
+    exit 1
+  in
+
   let check_arg_implies (arg0 : bool) (name0 : string) (arg1 : bool)
       (name1 : string) : unit =
     check_arg_name name0;
@@ -825,17 +835,23 @@ let () =
         ());
 
       (* Apply the pre-passes *)
-      let m = Aeneas.PrePasses.apply_passes m in
+      let m =
+        try Aeneas.PrePasses.apply_passes m
+        with Errors.CFailure error -> fail_crate error
+      in
 
       (* Test the unit functions with the concrete interpreter *)
       if !test_unit_functions then Test.test_unit_functions m;
 
       (* Translate or borrow-check the crate *)
       let extracted_opaque = ref false in
-      if !borrow_check then Aeneas.BorrowCheck.borrow_check_crate m marked_ids
-      else
-        Aeneas.Translate.translate_crate filename dest_dir !Config.subdir m
-          extracted_opaque marked_ids;
+      (try
+         if !borrow_check then
+           Aeneas.BorrowCheck.borrow_check_crate m marked_ids
+         else
+           Aeneas.Translate.translate_crate filename dest_dir !Config.subdir m
+             extracted_opaque marked_ids
+       with Errors.CFailure error -> fail_crate error);
 
       let has_errors =
         if !Errors.error_list <> [] then true
