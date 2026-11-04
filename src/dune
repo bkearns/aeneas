@@ -223,7 +223,7 @@
 (executable
  (name test_diagnose)
  (modules Test_diagnose)
- (libraries aeneas))
+ (libraries aeneas unix))
 
 (rule
  (alias runtest)

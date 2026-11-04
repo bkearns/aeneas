@@ -145,6 +145,15 @@ let eval_loop_symbolic_synthesize_loop_body (config : config) (span : span)
 
   (* First, evaluate the loop body starting from the **fixed-point** context *)
   let ctx_resl, cf_loop = comp cc (eval_loop_body fp_ctx) in
+  if Diagnose.sampling_enabled () then begin
+    Diagnose.note_loop_body ~paths:(List.length ctx_resl);
+    let count f = List.length (List.filter (fun (_, res) -> f res) ctx_resl) in
+    Diagnose.note_path_kinds ~unit:(count (fun r -> r = Unit))
+      ~brk:(count (function Break _ -> true | _ -> false))
+      ~cont:(count (function Continue _ -> true | _ -> false))
+      ~ret:(count (fun r -> r = Return))
+      ~panic:(count (fun r -> r = Panic))
+  end;
 
   (* Small helpers *)
   let reorder_input_abs (map : abs AbsId.Map.t) (absl : abs_id list) : abs list
@@ -157,6 +166,24 @@ let eval_loop_symbolic_synthesize_loop_body (config : config) (span : span)
   in
 
   let ctx_info_at_break = ref None in
+
+  (* What one more path's matched context costs on top of the first: sampled, because it
+     walks a whole context. Zero would mean the paths have nothing of their own and the list
+     is cheap; a context's worth means each path is a separate state. *)
+  let first_matched : eval_ctx option ref = ref None in
+  let matched_count = ref 0 in
+  let note_matched (tgt_ctx : eval_ctx) : unit =
+    if Diagnose.sampling_enabled () then begin
+      incr matched_count;
+      if !matched_count mod 128 = 0 then
+        match !first_matched with
+        | None -> first_matched := Some tgt_ctx
+        | Some first ->
+            let both = Obj.reachable_words (Obj.repr (first, tgt_ctx)) in
+            let one = Obj.reachable_words (Obj.repr first) in
+            Diagnose.note_path_marginal ~words:(both - one) ~first:one
+    end
+  in
 
   (* Then, do a special treatment of the break and continue cases.
      For now, we forbid having breaks in loops (and eliminate breaks
@@ -321,6 +348,7 @@ let eval_loop_symbolic_synthesize_loop_body (config : config) (span : span)
           match_ctx_with_target config span WithCont fixed_aids fixed_dids
             fp_input_abs fp_input_svalues fp_ctx ~recoverable:false ctx
         in
+        note_matched tgt_ctx;
         let input_values = reorder_input_values input_values fp_input_svalues in
         let input_abs = reorder_input_abs input_abs fp_input_abs in
         let e =

@@ -100,14 +100,17 @@ let current_item : string Atomic.t = Atomic.make ""
 let sample_line ~(elapsed : float) ~(phase : string) ~(item : string)
     ~(live_words : int) ~(heap_words : int) ~(top_heap_words : int)
     ~(minor_words : int) ~(major_collections : int) ~(steps : int) ~(env_len : int)
-    ~(env_vars : int) ~(env_dummies : int) ~(env_abs : int) : string =
+    ~(env_vars : int) ~(env_dummies : int) ~(env_abs : int)
+    ?(probe : string = "") () : string =
   Printf.sprintf
     "stat t=%.1fs phase=%s live_words=%d live_mib=%.1f heap_words=%d heap_mib=%.1f \
      top_heap_words=%d minor_words=%d major_collections=%d steps=%d env=%d vars=%d \
-     dummies=%d abs=%d item=%s"
+     dummies=%d abs=%d%s item=%s"
     elapsed phase live_words (words_to_mib live_words) heap_words
     (words_to_mib heap_words) top_heap_words minor_words major_collections steps
-    env_len env_vars env_dummies env_abs item
+    env_len env_vars env_dummies env_abs
+    (if probe = "" then "" else " " ^ probe)
+    item
 
 let write_lock = Mutex.create ()
 
@@ -151,6 +154,211 @@ let bump ?(env = 0) ?(vars = 0) ?(dummies = 0) ?(abs = 0) () : unit =
     Atomic.set env_abs abs
   end
 
+(* --- How wide a body gets, and why ------------------------------------------------ *)
+
+(* Symbolic execution returns one evaluation context per path of a body, and a context
+   holds a whole environment, so the width of that list is what the body costs. Two things
+   widen it: a branching statement whose branches are joined collapses back to one
+   context, and one whose branches are not joined keeps them apart -- either because a
+   branch leaves the block (break, continue, return), where joining is not attempted, or
+   because the join failed, where it is attempted and gives up. A failed join is
+   recoverable by default and duplicates the code after the branch silently, so from the
+   outside the two cases look the same. Which of them produces the width decides the fix:
+   if it is failures, joining harder narrows the list; if it is paths that legitimately
+   leave, nothing about joining helps and the list is what has to stop being materialized.
+
+   The widths are summed rather than averaged because a width is a product of the branch
+   points on the way to it: the sum says which cause accounts for the paths that exist. *)
+
+(** What happened at a branching statement whose branches produced [width] contexts. *)
+type join_outcome =
+  | Joined  (** one context out; the rest of the block is evaluated once *)
+  | Failed  (** the join raised; the paths stay separate and the rest is duplicated *)
+  | Skipped  (** a branch leaves the block; joining is not attempted *)
+
+let join_counts : int Atomic.t array =
+  [| Atomic.make 0; Atomic.make 0; Atomic.make 0 |]
+
+let join_widths : int Atomic.t array =
+  [| Atomic.make 0; Atomic.make 0; Atomic.make 0 |]
+
+let join_width_max : int Atomic.t array =
+  [| Atomic.make 0; Atomic.make 0; Atomic.make 0 |]
+
+(** Where the widest list came from, so a number in a log names a statement. *)
+let join_where : string Atomic.t array =
+  [| Atomic.make ""; Atomic.make ""; Atomic.make "" |]
+
+let join_continuing_max : int Atomic.t array =
+  [| Atomic.make 0; Atomic.make 0; Atomic.make 0 |]
+
+let skip_continuing : int Atomic.t = Atomic.make 0
+
+let ctx_list_where : string Atomic.t = Atomic.make ""
+
+let index_of = function Joined -> 0 | Failed -> 1 | Skipped -> 2
+
+(** One branching statement: how many contexts its branches ended in, and what was done
+    with them.
+
+    [continuing] is how many of those contexts carry [Unit] -- the ones that go on to be
+    evaluated on the rest of the block. A context that carries [Break], [Continue] or
+    [Return] is finished: the rest of the block is not evaluated on it, so it does not
+    widen anything. Counting the two apart says whether a width is a set of paths that
+    really do continue side by side, or a set of exits that only look like paths. *)
+let note_switch_join ~(outcome : join_outcome) ~(width : int)
+    ~(continuing : int) ~(where : unit -> string) : unit =
+  if sampling_enabled () then begin
+    let i = index_of outcome in
+    ignore (Atomic.fetch_and_add join_counts.(i) 1);
+    ignore (Atomic.fetch_and_add join_widths.(i) width);
+    if width > Atomic.get join_width_max.(i) then begin
+      Atomic.set join_width_max.(i) width;
+      (* [where] is forced only here: naming a statement costs a lookup and a string. *)
+      Atomic.set join_where.(i) (where ());
+      Atomic.set join_continuing_max.(i) continuing
+    end;
+    if outcome = Skipped then begin
+      ignore (Atomic.fetch_and_add skip_continuing continuing)
+    end
+  end
+
+let ctx_list_count : int Atomic.t = Atomic.make 0
+let ctx_list_width : int Atomic.t = Atomic.make 0
+let ctx_list_width_max : int Atomic.t = Atomic.make 0
+
+(** One statement list, and the number of paths it ended in. *)
+let note_ctx_list ~(width : int) ~(where : unit -> string) : unit =
+  if sampling_enabled () then begin
+    ignore (Atomic.fetch_and_add ctx_list_count 1);
+    ignore (Atomic.fetch_and_add ctx_list_width width);
+    if width > Atomic.get ctx_list_width_max then begin
+      Atomic.set ctx_list_width_max width;
+      Atomic.set ctx_list_where (where ())
+    end
+  end
+
+let loop_body_paths : int Atomic.t = Atomic.make 0
+let loop_body_paths_max : int Atomic.t = Atomic.make 0
+let loop_body_evals : int Atomic.t = Atomic.make 0
+
+(** One evaluation of a loop body done only to learn where it goes: the number of paths it
+    ended in, all of them held at once. *)
+let note_loop_body ~(paths : int) : unit =
+  if sampling_enabled () then begin
+    ignore (Atomic.fetch_and_add loop_body_evals 1);
+    ignore (Atomic.fetch_and_add loop_body_paths paths);
+    if paths > Atomic.get loop_body_paths_max then
+      Atomic.set loop_body_paths_max paths
+  end
+
+(* How a body's paths end. A path that ends in [Unit] goes on to the rest of the block; one
+   that ends in [Break], [Continue], [Return] or [Panic] is finished. The split is what says
+   whether a width is a set of states that really do continue side by side -- which joining
+   could merge -- or a set of exits, which it cannot. *)
+
+let path_units : int Atomic.t = Atomic.make 0
+let path_breaks : int Atomic.t = Atomic.make 0
+let path_continues : int Atomic.t = Atomic.make 0
+let path_returns : int Atomic.t = Atomic.make 0
+let path_panics : int Atomic.t = Atomic.make 0
+
+let note_path_kinds ~(unit : int) ~(brk : int) ~(cont : int) ~(ret : int)
+    ~(panic : int) : unit =
+  if sampling_enabled () then begin
+    ignore (Atomic.fetch_and_add path_units unit);
+    ignore (Atomic.fetch_and_add path_breaks brk);
+    ignore (Atomic.fetch_and_add path_continues cont);
+    ignore (Atomic.fetch_and_add path_returns ret);
+    ignore (Atomic.fetch_and_add path_panics panic)
+  end
+
+(** What one more retained path costs on top of the first one: the words reachable from
+    both, minus the words reachable from the first. Kept because it is the number that
+    decides whether a wide list is a list of states or a list of pointers at one state. *)
+let path_marginal_n : int Atomic.t = Atomic.make 0
+let path_marginal_words : int Atomic.t = Atomic.make 0
+let path_marginal_max : int Atomic.t = Atomic.make 0
+let path_first_words : int Atomic.t = Atomic.make 0
+
+let note_path_marginal ~(words : int) ~(first : int) : unit =
+  if sampling_enabled () then begin
+    ignore (Atomic.fetch_and_add path_marginal_n 1);
+    ignore (Atomic.fetch_and_add path_marginal_words words);
+    if words > Atomic.get path_marginal_max then
+      Atomic.set path_marginal_max words;
+    Atomic.set path_first_words first
+  end
+
+let reset_probe () : unit =
+  if sampling_enabled () then begin
+    Array.iter (fun a -> Atomic.set a 0) join_counts;
+    Array.iter (fun a -> Atomic.set a 0) join_widths;
+    Array.iter (fun a -> Atomic.set a 0) join_width_max;
+    Array.iter (fun a -> Atomic.set a 0) join_continuing_max;
+    Array.iter (fun a -> Atomic.set a "") join_where;
+    Atomic.set skip_continuing 0;
+    Atomic.set ctx_list_count 0;
+    Atomic.set ctx_list_width 0;
+    Atomic.set ctx_list_width_max 0;
+    Atomic.set ctx_list_where "";
+    Atomic.set loop_body_paths 0;
+    Atomic.set loop_body_paths_max 0;
+    Atomic.set loop_body_evals 0;
+    Atomic.set path_units 0;
+    Atomic.set path_breaks 0;
+    Atomic.set path_continues 0;
+    Atomic.set path_returns 0;
+    Atomic.set path_panics 0;
+    Atomic.set path_marginal_n 0;
+    Atomic.set path_marginal_words 0;
+    Atomic.set path_marginal_max 0;
+    Atomic.set path_first_words 0
+  end
+
+(** [sum] / [count], or 0 when nothing was counted. *)
+let mean (sum : int Atomic.t) (count : int Atomic.t) : int =
+  match Atomic.get count with 0 -> 0 | n -> Atomic.get sum / n
+
+let probe_text () : string =
+  if not (sampling_enabled ()) then ""
+  else
+    let one name i =
+      Printf.sprintf "%s_n=%d %s_avg=%d %s_max=%d %s_cont=%d %s_at=[%s]" name
+        (Atomic.get join_counts.(i)) name
+        (mean join_widths.(i) join_counts.(i))
+        name
+        (Atomic.get join_width_max.(i)) name
+        (Atomic.get join_continuing_max.(i)) name
+        (Atomic.get join_where.(i))
+    in
+    String.concat " "
+      [
+        one "joined" 0;
+        one "failed" 1;
+        one "skipped" 2;
+        Printf.sprintf "skip_cont_sum=%d" (Atomic.get skip_continuing);
+        Printf.sprintf "ctxlist_n=%d ctxlist_avg=%d ctxlist_max=%d ctxlist_at=[%s]"
+          (Atomic.get ctx_list_count)
+          (mean ctx_list_width ctx_list_count)
+          (Atomic.get ctx_list_width_max)
+          (Atomic.get ctx_list_where);
+        Printf.sprintf "loopbody_n=%d loopbody_avg=%d loopbody_max=%d"
+          (Atomic.get loop_body_evals)
+          (mean loop_body_paths loop_body_evals)
+          (Atomic.get loop_body_paths_max);
+        Printf.sprintf
+          "kinds unit=%d break=%d cont=%d ret=%d panic=%d marginal_n=%d \
+           marginal_avg_w=%d marginal_max_w=%d first_w=%d"
+          (Atomic.get path_units) (Atomic.get path_breaks)
+          (Atomic.get path_continues) (Atomic.get path_returns)
+          (Atomic.get path_panics)
+          (Atomic.get path_marginal_n)
+          (mean path_marginal_words path_marginal_n)
+          (Atomic.get path_marginal_max)
+          (Atomic.get path_first_words);
+      ]
+
 (** Write one sample now. Cheap when sampling is off. *)
 let sample () : unit =
   if sampling_enabled () then
@@ -164,7 +372,7 @@ let sample () : unit =
          ~major_collections:st.Gc.major_collections
          ~steps:(Atomic.get steps) ~env_len:(Atomic.get env_len)
          ~env_vars:(Atomic.get env_vars) ~env_dummies:(Atomic.get env_dummies)
-         ~env_abs:(Atomic.get env_abs))
+         ~env_abs:(Atomic.get env_abs) ~probe:(probe_text ()) ())
 
 (** Enter a phase: record it immediately, so even a short phase names itself, then keep
     sampling. Every phase boundary is a sample, which is what makes a killed run's file
@@ -185,7 +393,8 @@ let set_item (i : string) : unit =
     Atomic.set current_item i;
     (* [steps] is per declaration: a sample of a new function starts at zero, so the
        counter reads as "statements evaluated in this function". *)
-    Atomic.set steps 0
+    Atomic.set steps 0;
+    reset_probe ()
   end
 
 let sampler_started = ref false

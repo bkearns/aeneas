@@ -754,6 +754,27 @@ and eval_statement_list (config : config) span (stmts : statement list) :
            expression from the continuations for the individual branches
       *)
       let ctx_resl, cf_st2 = comp_seqs __FILE__ __LINE__ span ctx_res_cfl in
+      if Diagnose.sampling_enabled () then begin
+        let width = List.length ctx_resl in
+        Diagnose.note_ctx_list ~width
+          ~where:(fun () -> Errors.raw_span_to_string span);
+        (* A wide list is the memory: whether it costs one context per path or almost
+           nothing per path is the difference between a list of states and a list of
+           pointers at one state, and it is not visible from the width. Only wide lists
+           are measured, because the walk costs a whole context. *)
+        if width >= 256 then begin
+          let rec last_of = function
+            | [ x ] -> x
+            | _ :: tl -> last_of tl
+            | [] -> assert false
+          in
+          let first_ctx = fst (List.hd ctx_resl) in
+          let last_ctx = fst (last_of ctx_resl) in
+          let one = Obj.reachable_words (Obj.repr first_ctx) in
+          let both = Obj.reachable_words (Obj.repr (first_ctx, last_ctx)) in
+          Diagnose.note_path_marginal ~words:(both - one) ~first:one
+        end
+      end;
       (ctx_resl, compose_trace span cf_st1 cf_st2)
 
 and eval_block (config : config) (b : block) : stl_cm_fun =
@@ -982,13 +1003,7 @@ and eval_switch_raw (config : config) (span : Meta.span) (data : switch_data)
               | [ e_true; e_false ] -> cf_bool (e_true, e_false)
               | _ -> [%internal_error] span
             in
-            if join then
-              try eval_switch_with_join config span cc ctx0 ctx_resl
-              with Errors.RFailure ->
-                (* If the join threw a recoverable error we do not join
-                   and simply duplicate the code *)
-                (ctx_resl, cc)
-            else (ctx_resl, cc)
+            join_branches_or_duplicate config span ~join cc ctx0 ctx_resl
         | VLiteral (VScalar sv), TScalar (TInteger _ as int_ty) ->
             (* Sanity check *)
             [%sanity_check] span (Scalars.get_ty sv = scalar_as_integer int_ty);
@@ -1039,16 +1054,7 @@ and eval_switch_raw (config : config) (span : Meta.span) (data : switch_data)
               cf_int (el, e_otherwise)
             in
             let cf = cc_comp cc cf in
-            if join then
-              (* Join the contexts *)
-              try eval_switch_with_join config span cf ctx0 resl
-              with Errors.RFailure ->
-                (* If the join threw a recoverable error we do not join
-                   and simply duplicate the code *)
-                (resl, cf)
-            else
-              (* Do not join the contexts: compose the continuations and continue *)
-              (resl, cf)
+            join_branches_or_duplicate config span ~join cf ctx0 resl
         | _ -> [%craise] span "Unsupported switch scrutinee"
       in
       (* Compose *)
@@ -1098,19 +1104,54 @@ and eval_switch_raw (config : config) (span : Meta.span) (data : switch_data)
             in
             let ctx_resl, cf = comp_seqs __FILE__ __LINE__ span resl in
             let cc = cc_comp cf_expand cf in
-            if join then (* Join the contexts *)
-              try eval_switch_with_join config span cc ctx0 ctx_resl
-              with Errors.RFailure ->
-                (* If the join threw a recoverable error we do not join
-                   and simply duplicate the code *)
-                (ctx_resl, cc)
-            else
-              (* Compose the continuations *)
-              (ctx_resl, cc)
+            join_branches_or_duplicate config span ~join cc ctx0 ctx_resl
         | _ -> [%craise] span "Inconsistent state"
       in
       (* Compose *)
       (ctx_resl, cc_comp cf_read_p cf_match)
+
+(** Join the contexts the branches of a switch ended in, or duplicate the code after it.
+
+    Joining is what keeps a body narrow: with it, [n] branch contexts become one and the
+    rest of the block is evaluated once. Without it, every branch continues on its own and
+    the rest of the block is evaluated once per branch -- so one switch that is not joined
+    multiplies the number of paths through the enclosing function rather than widening it
+    by one, and nested switches multiply.
+
+    A join is not attempted when a branch leaves the block ([break], [continue],
+    [return]): the rest of the block is only reachable from the branches that stay, and
+    there is nothing to merge with the ones that go. When it is attempted and fails, joins
+    are recoverable by default and the failure is silent: the same duplication happens for
+    a reason that has nothing to do with control flow. [Diagnose.note_switch_join] records
+    which of the two it was. *)
+and join_branches_or_duplicate (config : config) (span : Meta.span)
+    ~(join : bool) (cf : SA.expr list -> SA.expr) (ctx0 : eval_ctx)
+    (ctx_resl : (eval_ctx * statement_eval_res) list) :
+    (eval_ctx * statement_eval_res) list * (SA.expr list -> SA.expr) =
+  let probe (outcome : Diagnose.join_outcome) : unit =
+    if Diagnose.sampling_enabled () then begin
+      let width = List.length ctx_resl in
+      let continuing =
+        List.length (List.filter (fun (_, res) -> res = Unit) ctx_resl)
+      in
+      Diagnose.note_switch_join ~outcome ~width ~continuing
+        ~where:(fun () -> Errors.raw_span_to_string span)
+    end
+  in
+  if not join then begin
+    probe Diagnose.Skipped;
+    (ctx_resl, cf)
+  end
+  else
+    match eval_switch_with_join config span cf ctx0 ctx_resl with
+    | resl, cf ->
+        probe Diagnose.Joined;
+        (resl, cf)
+    | exception Errors.RFailure ->
+        (* If the join threw a recoverable error we do not join and simply
+           duplicate the code *)
+        probe Diagnose.Failed;
+        (ctx_resl, cf)
 
 (** Evaluate a switch in case we need to branch and want to join the contexts
     afterwards.

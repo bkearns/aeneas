@@ -38,7 +38,7 @@ let test_line () =
       ~item:"crate::metadata::visit_map" ~live_words:(4 * 131072) ~heap_words:(5 * 131072)
       ~top_heap_words:(6 * 131072) ~minor_words:1000 ~major_collections:7 ~steps:42
       ~env_vars:7 ~env_dummies:25 ~env_abs:5
-      ~env_len:37
+      ~env_len:37 ()
   in
   check "sample names its phase" (contains line "phase=transparent-functions") line;
   check "sample reports live words" (contains line "live_words=524288") line;

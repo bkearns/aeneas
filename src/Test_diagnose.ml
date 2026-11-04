@@ -34,9 +34,15 @@ let expect_int (what : string) (expected : int) (actual : int) =
 let expect_bool (what : string) (expected : bool) (actual : bool) =
   if expected <> actual then begin
     incr failures;
-    Printf.printf "FAIL  %-44s expected %-5b got %-5b\n" what expected actual
+    Printf.printf "FAIL  %-44s expected %-5b got %b\n" what expected actual
   end
   else Printf.printf "PASS  %-44s %b\n" what actual
+
+(** Substring, for checking fields of a line whose others are not under test. *)
+let contains (haystack : string) (needle : string) : bool =
+  let nl = String.length needle and hl = String.length haystack in
+  let rec at i = i + nl <= hl && (String.sub haystack i nl = needle || at (i + 1)) in
+  nl = 0 || at 0
 
 let () =
   (* 131072 words = 1 MiB, so the unit is checkable by hand. *)
@@ -82,6 +88,35 @@ let () =
     (Diagnose.over_budget ~limit_mb:100 ~live_words:(99 * 131_072));
   expect_bool "budget: 101 MiB of a 100 MiB limit is over" true
     (Diagnose.over_budget ~limit_mb:100 ~live_words:(101 * 131_072));
+
+  (* Which of the two reasons made a body wide. A switching statement whose branches are
+     not joined evaluates the rest of the block once per branch, and there are two ways to
+     get there: a branch leaves the block, where joining is not attempted, or the join was
+     attempted and failed, where recoverable joins make it silent. Nothing else tells them
+     apart, and they call for opposite fixes, so the account is pinned here. A join that
+     succeeds is worth one context however many branches it had. *)
+
+  (* Sampling is opt-in; this turns it on for the process without touching a file, since
+     only the counters are read here. *)
+  Unix.putenv "AENEAS_STAT_FILE" "/dev/null";
+  Diagnose.reset_probe ();
+  Diagnose.note_switch_join ~outcome:Diagnose.Skipped ~width:8192 ~continuing:1
+    ~where:(fun () -> "wide");
+  Diagnose.note_switch_join ~outcome:Diagnose.Skipped ~width:2 ~continuing:2
+    ~where:(fun () -> "narrow");
+  Diagnose.note_switch_join ~outcome:Diagnose.Joined ~width:2 ~continuing:2
+    ~where:(fun () -> "joined");
+  let text = Diagnose.probe_text () in
+  expect_bool "join account: two branch points skipped, one joined" true
+    (contains text "skipped_n=2" && contains text "joined_n=1");
+  expect_bool "join account: no join failed, so nothing went silent" true
+    (contains text "failed_n=0");
+  expect_bool "join account: a skipped point reports its width" true
+    (contains text "skipped_max=8192");
+  expect_bool "join account: and how many of its contexts go on" true
+    (contains text "skipped_cont=1");
+  expect_bool "join account: the widths accumulate for the sum" true
+    (contains text "skip_cont_sum=3");
 
   Printf.printf "\n%s\n"
     (if !failures = 0 then "ALL PASS" else Printf.sprintf "%d FAILED" !failures);

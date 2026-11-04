@@ -162,6 +162,8 @@ let compute_loop_entry_fixed_point (config : config) (span : Meta.span)
       Diagnose.set_phase ~clear_item:false ("loop-iter-" ^ string_of_int i);
       (* The trace is discarded: this is a search for a context, not for a program. *)
       let ctx_resl, _ = Cps.without_trace (fun () -> eval_loop_body ctx) in
+      if Diagnose.sampling_enabled () then
+        Diagnose.note_loop_body ~paths:(List.length ctx_resl);
       (* Keep only the contexts which reached a `continue`. *)
       let keep_continue_ctx (ctx, res) =
         [%ltrace "register_continue_ctx"];
@@ -280,6 +282,8 @@ let compute_loop_break_context (config : config) (span : Meta.span)
   let eval_break_ctxs () =
     (* Evaluate the loop body to register the different contexts at a break. *)
     let ctx_resl, _ = Cps.without_trace (fun () -> eval_loop_body fp_ctx) in
+    if Diagnose.sampling_enabled () then
+      Diagnose.note_loop_body ~paths:(List.length ctx_resl);
     let keep_break_ctx (ctx, res) : eval_ctx option =
       [%ltrace "register_break_ctx"];
       match res with
