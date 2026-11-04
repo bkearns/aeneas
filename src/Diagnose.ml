@@ -223,6 +223,78 @@ let note_switch_join ~(outcome : join_outcome) ~(width : int)
     end
   end
 
+(** Where the contexts a statement list ends in came from.
+
+    A list is wide either because the paths in it really do run side by side -- each has to
+    be evaluated on the rest of the block -- or because it also carries the paths that have
+    already finished, which nothing evaluates again. Only the first kind can be narrowed by
+    joining; the second is pure retention, and the only fix is to stop keeping it. Summing
+    the two apart across a declaration says which it is, without a per-statement log. *)
+let origin_units : int Atomic.t = Atomic.make 0
+let origin_exits : int Atomic.t = Atomic.make 0
+let origin_max_exits : int Atomic.t = Atomic.make 0
+
+let note_list_origins ~(units : int) ~(exits : int) : unit =
+  if sampling_enabled () then begin
+    ignore (Atomic.fetch_and_add origin_units units);
+    ignore (Atomic.fetch_and_add origin_exits exits);
+    if exits > Atomic.get origin_max_exits then Atomic.set origin_max_exits exits
+  end
+
+(** A branch point that was not joined, bucketed by how many of its results continue.
+
+    A switch that leaves the block from one arm still has the other arms' contexts
+    continuing side by side, and today the whole switch declines to join as soon as any arm
+    can leave. So the bucket says whether the width is one continuing context per exit --
+    which no join helps -- or several, which a join would collapse to one. *)
+let skip_unit_buckets = 4
+
+let skip_by_units : int Atomic.t array =
+  Array.init skip_unit_buckets (fun _ -> Atomic.make 0)
+
+let skip_width_by_units : int Atomic.t array =
+  Array.init skip_unit_buckets (fun _ -> Atomic.make 0)
+
+let skip_maxwidth_by_units : int Atomic.t array =
+  Array.init skip_unit_buckets (fun _ -> Atomic.make 0)
+
+let bucket_of_units n =
+  if n < 0 then 0 else if n >= skip_unit_buckets - 1 then skip_unit_buckets - 1 else n
+
+let note_skip_shape ~(units : int) ~(width : int) : unit =
+  if sampling_enabled () then begin
+    let b = bucket_of_units units in
+    ignore (Atomic.fetch_and_add skip_by_units.(b) 1);
+    ignore (Atomic.fetch_and_add skip_width_by_units.(b) width);
+    if width > Atomic.get skip_maxwidth_by_units.(b) then
+      Atomic.set skip_maxwidth_by_units.(b) width
+  end
+
+(** The shape of the widest list seen: how many of its contexts continue, how many are
+    finished, and how wide each of the branch point's arms was. Arm widths say whether the
+    width is one arm or all of them, which decides whether joining or retention is the
+    lever. *)
+let widest_shape : string Atomic.t = Atomic.make ""
+
+let note_shape ~(width : int) ~(units : int) ~(exits : int) ~(arms : int list)
+    ~(where : string) : unit =
+  if sampling_enabled () then begin
+    let current =
+      match Atomic.get widest_shape with
+      | "" -> 0
+      | s -> (
+          match String.index_opt s ' ' with
+          | Some i -> ( try int_of_string (String.sub s 2 (i - 2)) with _ -> 0)
+          | None -> 0)
+    in
+    if width > current then
+      Atomic.set widest_shape
+        (Printf.sprintf "w=%d units=%d exits=%d arms=[%s] at=[%s]" width units
+           exits
+           (String.concat "," (List.map string_of_int arms))
+           where)
+  end
+
 let ctx_list_count : int Atomic.t = Atomic.make 0
 let ctx_list_width : int Atomic.t = Atomic.make 0
 let ctx_list_width_max : int Atomic.t = Atomic.make 0
@@ -313,7 +385,14 @@ let reset_probe () : unit =
     Atomic.set path_marginal_n 0;
     Atomic.set path_marginal_words 0;
     Atomic.set path_marginal_max 0;
-    Atomic.set path_first_words 0
+    Atomic.set path_first_words 0;
+    Atomic.set origin_units 0;
+    Atomic.set origin_exits 0;
+    Atomic.set origin_max_exits 0;
+    Array.iter (fun a -> Atomic.set a 0) skip_by_units;
+    Array.iter (fun a -> Atomic.set a 0) skip_width_by_units;
+    Array.iter (fun a -> Atomic.set a 0) skip_maxwidth_by_units;
+    Atomic.set widest_shape ""
   end
 
 (** [sum] / [count], or 0 when nothing was counted. *)
@@ -357,6 +436,24 @@ let probe_text () : string =
           (mean path_marginal_words path_marginal_n)
           (Atomic.get path_marginal_max)
           (Atomic.get path_first_words);
+        Printf.sprintf "origins units=%d exits=%d max_exits=%d"
+          (Atomic.get origin_units) (Atomic.get origin_exits)
+          (Atomic.get origin_max_exits);
+        Printf.sprintf "skips_units[0]=%d/avg%d/max%d [1]=%d/avg%d/max%d [2]=%d/avg%d/max%d \
+                        [3+]=%d/avg%d/max%d"
+          (Atomic.get skip_by_units.(0))
+          (mean skip_width_by_units.(0) skip_by_units.(0))
+          (Atomic.get skip_maxwidth_by_units.(0))
+          (Atomic.get skip_by_units.(1))
+          (mean skip_width_by_units.(1) skip_by_units.(1))
+          (Atomic.get skip_maxwidth_by_units.(1))
+          (Atomic.get skip_by_units.(2))
+          (mean skip_width_by_units.(2) skip_by_units.(2))
+          (Atomic.get skip_maxwidth_by_units.(2))
+          (Atomic.get skip_by_units.(3))
+          (mean skip_width_by_units.(3) skip_by_units.(3))
+          (Atomic.get skip_maxwidth_by_units.(3));
+        Printf.sprintf "widest=(%s)" (Atomic.get widest_shape);
       ]
 
 (** Write one sample now. Cheap when sampling is off. *)

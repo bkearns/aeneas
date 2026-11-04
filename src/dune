@@ -321,6 +321,16 @@
   (run ./test_trace_discard.exe)))
 
 (executable
+ (name test_join_width)
+ (modules Test_join_width)
+ (libraries aeneas))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_join_width.exe)))
+
+(executable
  (name test_trace_ring)
  (modules Test_trace_ring)
  (libraries aeneas))

@@ -758,6 +758,12 @@ and eval_statement_list (config : config) span (stmts : statement list) :
         let width = List.length ctx_resl in
         Diagnose.note_ctx_list ~width
           ~where:(fun () -> Errors.raw_span_to_string span);
+        (* How much of this list is retention rather than parallelism: the paths that have
+           already finished are carried here and evaluated nowhere else. *)
+        let units =
+          List.length (List.filter (fun (_, res) -> res = Unit) ctx_resl)
+        in
+        Diagnose.note_list_origins ~units ~exits:(width - units);
         (* A wide list is the memory: whether it costs one context per path or almost
            nothing per path is the difference between a list of states and a list of
            pointers at one state, and it is not visible from the width. Only wide lists
@@ -988,13 +994,11 @@ and eval_switch_raw (config : config) (span : Meta.span) (data : switch_data)
                 (S.mk_opt_place_from_op span op ctx)
                 ctx
             in
-            (* Check if we should join the states after the if then else *)
-            let join =
-              (not (block_has_break_continue_return true_block))
-              && not (block_has_break_continue_return false_block)
-            in
             let resl_true = eval_block config true_block true_ctx in
             let resl_false = eval_block config false_block false_ctx in
+            let arm_widths =
+              [ List.length (fst resl_true); List.length (fst resl_false) ]
+            in
             let ctx_resl, cf_branches =
               comp_seqs __FILE__ __LINE__ span [ resl_true; resl_false ]
             in
@@ -1003,7 +1007,8 @@ and eval_switch_raw (config : config) (span : Meta.span) (data : switch_data)
               | [ e_true; e_false ] -> cf_bool (e_true, e_false)
               | _ -> [%internal_error] span
             in
-            join_branches_or_duplicate config span ~join cc ctx0 ctx_resl
+            join_branches_or_duplicate config span ~arm_widths cc ctx0
+              ctx_resl
         | VLiteral (VScalar sv), TScalar (TInteger _ as int_ty) ->
             (* Sanity check *)
             [%sanity_check] span (Scalars.get_ty sv = scalar_as_integer int_ty);
@@ -1040,10 +1045,9 @@ and eval_switch_raw (config : config) (span : Meta.span) (data : switch_data)
             (* Then evaluate the "otherwise" branch *)
             let resl_otherwise = eval_block config otherwise ctx_otherwise in
 
-            (* Should we join the contexts after the switch? *)
-            let join =
-              (not (List.exists block_has_break_continue_return target_blocks))
-              && not (block_has_break_continue_return otherwise)
+            let arm_widths =
+              List.map (fun r -> List.length (fst r)) resl_branches
+              @ [ List.length (fst resl_otherwise) ]
             in
             let resl, cf =
               comp_seqs __FILE__ __LINE__ span
@@ -1054,7 +1058,7 @@ and eval_switch_raw (config : config) (span : Meta.span) (data : switch_data)
               cf_int (el, e_otherwise)
             in
             let cf = cc_comp cc cf in
-            join_branches_or_duplicate config span ~join cf ctx0 resl
+            join_branches_or_duplicate config span ~arm_widths cf ctx0 resl
         | _ -> [%craise] span "Unsupported switch scrutinee"
       in
       (* Compose *)
@@ -1098,13 +1102,11 @@ and eval_switch_raw (config : config) (span : Meta.span) (data : switch_data)
                 (fun ctx -> (eval_switch config span data branches) ctx)
                 ctxl
             in
-            (* Should we join the contexts after the match? *)
-            let join =
-              not (List.exists block_has_break_continue_return branches)
-            in
+            let arm_widths = List.map (fun r -> List.length (fst r)) resl in
             let ctx_resl, cf = comp_seqs __FILE__ __LINE__ span resl in
             let cc = cc_comp cf_expand cf in
-            join_branches_or_duplicate config span ~join cc ctx0 ctx_resl
+            join_branches_or_duplicate config span ~arm_widths cc ctx0
+              ctx_resl
         | _ -> [%craise] span "Inconsistent state"
       in
       (* Compose *)
@@ -1118,14 +1120,24 @@ and eval_switch_raw (config : config) (span : Meta.span) (data : switch_data)
     multiplies the number of paths through the enclosing function rather than widening it
     by one, and nested switches multiply.
 
-    A join is not attempted when a branch leaves the block ([break], [continue],
-    [return]): the rest of the block is only reachable from the branches that stay, and
-    there is nothing to merge with the ones that go. When it is attempted and fails, joins
-    are recoverable by default and the failure is silent: the same duplication happens for
-    a reason that has nothing to do with control flow. [Diagnose.note_switch_join] records
-    which of the two it was. *)
+    What decides it is the results, through {!Cps.joins}: two or more branches that ended in
+    [Unit] go on to the rest of the block and are worth merging, and a branch that ended in
+    [break], [continue] or [return] cannot be merged at all. Asking the sub-blocks instead
+    ("does any branch contain a [break] anywhere below it") answers a different question,
+    because a block's tail is where the loop's own [break] lives: it declined to join in
+    16476 of 16476 branch points measured on one crate, which duplicated the rest of the
+    block once per branch and left 8230 contexts in a single statement list.
+
+    A branch point that has finished paths *and* two or more continuing ones cannot be
+    joined as it stands, and that is not a limitation of this decision procedure: a [Let]
+    binds a value, so the symbolic AST forbids [break] and [continue] in the bound
+    expression ({!SymbolicToPureExpressions.translate_let} sets those builders to [None]),
+    and a join is exactly a [Let] over the branch expression. Merging the staying branches
+    therefore needs the continuation to be handed to each arm separately rather than as one
+    list, which is a change to {!Cps.stl_cm_fun} and its callers. Until then such a branch
+    point is duplicated, which is why the width is what it is. *)
 and join_branches_or_duplicate (config : config) (span : Meta.span)
-    ~(join : bool) (cf : SA.expr list -> SA.expr) (ctx0 : eval_ctx)
+    ?(arm_widths : int list = []) (cf : SA.expr list -> SA.expr) (ctx0 : eval_ctx)
     (ctx_resl : (eval_ctx * statement_eval_res) list) :
     (eval_ctx * statement_eval_res) list * (SA.expr list -> SA.expr) =
   let probe (outcome : Diagnose.join_outcome) : unit =
@@ -1135,10 +1147,18 @@ and join_branches_or_duplicate (config : config) (span : Meta.span)
         List.length (List.filter (fun (_, res) -> res = Unit) ctx_resl)
       in
       Diagnose.note_switch_join ~outcome ~width ~continuing
-        ~where:(fun () -> Errors.raw_span_to_string span)
+        ~where:(fun () -> Errors.raw_span_to_string span);
+      if outcome = Diagnose.Skipped then
+        Diagnose.note_skip_shape ~units:continuing ~width;
+      Diagnose.note_shape ~width ~units:continuing ~exits:(width - continuing)
+        ~arms:arm_widths
+        ~where:(Errors.raw_span_to_string span)
     end
   in
-  if not join then begin
+  let continuing =
+    List.length (List.filter (fun (_, res) -> res = Unit) ctx_resl)
+  in
+  if not (Cps.joins ~continuing ~exiting:(List.length ctx_resl - continuing)) then begin
     probe Diagnose.Skipped;
     (ctx_resl, cf)
   end

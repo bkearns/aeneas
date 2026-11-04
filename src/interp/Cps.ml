@@ -133,6 +133,32 @@ let cf_empty file line span e el =
   | [] -> e
   | _ -> internal_error file line span
 
+(** Whether a branch point's branches should be joined, from what they ended in.
+
+    [continuing] paths go on to the rest of the block and [exiting] ones have finished
+    ([break], [continue], [return] or a panic). Two or more continuing paths are worth
+    merging -- the rest of the block is then evaluated once instead of once per path -- and
+    a finished path cannot be merged with anything. The answers have to come from the
+    results rather than from inspecting the sub-blocks: a block's tail holds the enclosing
+    loop's own [break], so a syntactic scan says "can leave" about almost every branch point
+    in a body that loops or returns, and an over-cautious [No] here is paid for by
+    duplicating the rest of the block at every branch.
+
+    [exiting > 0] is a [No] for a reason that is structural rather than cautious: joining is
+    a [Let] over the branch expression, and {!SymbolicToPureExpressions.translate_let}
+    forbids [break], [continue] and [return] in a bound expression. *)
+let joins ~(continuing : int) ~(exiting : int) : bool =
+  continuing >= 2 && exiting = 0
+
+(** How wide a branch point leaves the rest of the block's input.
+
+    Kept next to {!joins} because it is the same arithmetic seen from the other side: a
+    joined branch point hands over one context however many branches it had, an unjoined one
+    hands over one per continuing branch, and a finished branch hands over a context that is
+    carried but never evaluated. *)
+let width_after_branch ~(continuing : int) ~(exiting : int) : int =
+  (if joins ~continuing ~exiting then 1 else continuing) + exiting
+
 (** It happens that we need to concatenate lists of results, for instance when
     evaluating the branches of a match. When applying the continuations to build
     the symbolic expressions, we need to decompose the list of expressions we
