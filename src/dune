@@ -329,3 +329,13 @@
  (alias runtest)
  (action
   (run ./test_trace_ring.exe)))
+
+(executable
+ (name test_ctx_sharing)
+ (modules Test_ctx_sharing)
+ (libraries aeneas))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_ctx_sharing.exe)))

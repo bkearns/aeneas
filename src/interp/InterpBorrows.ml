@@ -2175,8 +2175,16 @@ let destructure_abs (span : Meta.span) (abs_kind : abs_kind) ~(can_end : bool)
   (* Destructure the avalues *)
   List.iter (list_avalues 2 push_avalue) abs0.avalues;
   let avalues = !avalues in
-  (* Update *)
-  { abs0 with avalues; kind = abs_kind; can_end }
+  (* Update. If the destructuring changed nothing, return the original
+     abstraction: it is retained by the environment (see the comment on
+     structure sharing in {!Contexts}). *)
+  let unchanged =
+    abs0.kind = abs_kind
+    && abs0.can_end = can_end
+    && List.length avalues = List.length abs0.avalues
+    && List.for_all2 (fun av av0 -> av == av0) avalues abs0.avalues
+  in
+  if unchanged then abs0 else { abs0 with avalues; kind = abs_kind; can_end }
 
 let abs_is_destructured (span : Meta.span) (destructure_shared_values : bool)
     (ctx : eval_ctx) (abs : abs) : bool =

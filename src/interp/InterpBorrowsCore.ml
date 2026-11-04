@@ -704,9 +704,30 @@ let update_loan (span : Meta.span) (ek : exploration_kind) (l : BorrowId.id)
     end
   in
 
-  let ctx = obj#visit_eval_ctx () ctx in
-  (* Check that we updated at least one loan *)
-  [%sanity_check] span !r;
+  let ctx =
+    (* Exactly one environment element contains the loan: rebuild that element
+       and share the rest of the environment with [ctx], instead of leaving a
+       copy of the whole environment behind (see {!Contexts.env_map_first}). *)
+    let found = ref false in
+    let ctx =
+      ctx_map_first_elem ctx (fun ee ->
+          r := false;
+          let ee' =
+            match ee with
+            | EBinding (bv, v) -> EBinding (bv, obj#visit_tvalue () v)
+            | EAbs abs -> EAbs (obj#visit_abs () abs)
+            | EFrame -> ee
+          in
+          if !r then begin
+            found := true;
+            Some ee'
+          end
+          else None)
+    in
+    (* Check that we updated at least one loan *)
+    [%sanity_check] span !found;
+    ctx
+  in
   ctx
 
 (** Update a abstraction loan content.
@@ -755,9 +776,30 @@ let update_aloan (span : Meta.span) (ek : exploration_kind) (l : BorrowId.id)
     end
   in
 
-  let ctx = obj#visit_eval_ctx () ctx in
-  (* Check that we updated at least one loan *)
-  [%sanity_check] span !r;
+  let ctx =
+    (* Exactly one environment element contains the loan: rebuild that element
+       and share the rest of the environment with [ctx], instead of leaving a
+       copy of the whole environment behind (see {!Contexts.env_map_first}). *)
+    let found = ref false in
+    let ctx =
+      ctx_map_first_elem ctx (fun ee ->
+          r := false;
+          let ee' =
+            match ee with
+            | EBinding (bv, v) -> EBinding (bv, obj#visit_tvalue () v)
+            | EAbs abs -> EAbs (obj#visit_abs () abs)
+            | EFrame -> ee
+          in
+          if !r then begin
+            found := true;
+            Some ee'
+          end
+          else None)
+    in
+    (* Check that we updated at least one loan *)
+    [%sanity_check] span !found;
+    ctx
+  in
   ctx
 
 (** Lookup a borrow content from a borrow id. *)
@@ -988,11 +1030,20 @@ let update_aborrow (span : Meta.span) (ek : exploration_kind)
     | Some nv -> nv
   in
 
+  (* The abstract borrow (and the expression borrow which mirrors it when there
+     is one) live in one element of the environment each. We update an element
+     at a time and share the rest of the environment, instead of leaving a copy
+     of the whole environment behind (see {!Contexts.env_map_first}). [mode]
+     selects which of the two borrows the current pass rewrites. *)
+  let mode = ref `Aborrow in
+
   let obj =
     object
       inherit [_] map_eval_ctx as super
 
       method! visit_ABorrow env bc =
+        if !mode <> `Aborrow then super#visit_ABorrow env bc
+        else
         match bc with
         | AMutBorrow (pm, bid, av) ->
             (* Sanity check: projection markers can only appear when we're doing a join *)
@@ -1016,6 +1067,8 @@ let update_aborrow (span : Meta.span) (ek : exploration_kind)
             | UMut _ -> super#visit_ABorrow env bc)
 
       method! visit_EBorrow env bc =
+        if !mode <> `Eborrow then super#visit_EBorrow env bc
+        else
         match bc with
         | EMutBorrow (pm, bid, av) ->
             (* Sanity check: projection markers can only appear when we're doing a join *)
@@ -1030,9 +1083,29 @@ let update_aborrow (span : Meta.span) (ek : exploration_kind)
     end
   in
 
-  let ctx = obj#visit_eval_ctx () ctx in
+  let found = ref false in
+  let update_borrow (mode' : [ `Aborrow | `Eborrow ]) (ee : env_elem) :
+      env_elem option =
+    mode := mode';
+    r := false;
+    r_evalue := false;
+    let ee' =
+      match ee with
+      | EAbs abs -> EAbs (obj#visit_abs () abs)
+      | EBinding (bv, v) -> EBinding (bv, obj#visit_tvalue () v)
+      | EFrame -> ee
+    in
+    let fired = if mode' = `Aborrow then !r else !r_evalue in
+    if fired then begin
+      found := !found || mode' = `Aborrow;
+      Some ee'
+    end
+    else None
+  in
+  let ctx = ctx_map_first_elem ctx (update_borrow `Aborrow) in
+  let ctx = ctx_map_first_elem ctx (update_borrow `Eborrow) in
   (* Check that we updated at least one borrow *)
-  [%cassert] span !r "No borrow was updated";
+  [%cassert] span !found "No borrow was updated";
   ctx
 
 type mut_borrow_or_shared_loan_id =

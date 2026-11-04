@@ -2564,35 +2564,45 @@ let reorder_fresh_abs_aux (span : Meta.span) (old_abs_ids : AbsId.Set.t)
   (* **WARNING:** remember that the environments store the bindings in *reverse*
      order (the fresh values/abstractions get pushed at the beginning of the list,
      and when printing the environments we reverse them first) *)
-  (* Split between the fresh abstractions and the rest of the context *)
-  let env, fresh_abs =
-    List.partition
-      (function
-        | EAbs abs -> AbsId.Set.mem abs.abs_id old_abs_ids
-        | _ -> true)
-      ctx.env
+  (* Split between the fresh abstractions and the rest of the context. If there
+     is no fresh abstraction there is nothing to reorder: reducing a context is
+     on the hot path of the synthesis and the context is retained by it, so a
+     context which only goes through this function must not be rebuilt (see the
+     comment on structure sharing in {!Contexts}). *)
+  let is_fresh (ee : env_elem) =
+    match ee with
+    | EAbs abs -> not (AbsId.Set.mem abs.abs_id old_abs_ids)
+    | _ -> false
   in
+  if not (List.exists is_fresh ctx.env) then ctx
+  else
+    let env, fresh_abs =
+      List.partition
+        (function
+          | EAbs abs -> AbsId.Set.mem abs.abs_id old_abs_ids
+          | _ -> true)
+        ctx.env
+    in
 
-  (* Reorder the fresh abstractions.
+    (* Reorder the fresh abstractions.
 
-     We use the content of the abstractions to reorder them.
-     In practice, this allows us to reorder the abstractions by using the ids
-     of the loans, borrows and symbolic values. This is far from perfect, but
-     allows us to have a quite simple matching algorithm for now, to compute
-     the joins as well as to check whether two environments are equivalent.
-     We may want to make this algorithm more general in the future.
-  *)
-  let cmp abs0 abs1 =
-    match (abs0, abs1) with
-    | EAbs abs0, EAbs abs1 -> compare_tavalue_list abs0.avalues abs1.avalues
-    | _ -> [%internal_error] span
-  in
-  let fresh_abs = List.sort cmp fresh_abs |> List.rev in
+       We use the content of the abstractions to reorder them.
+       In practice, this allows us to reorder the abstractions by using the ids
+       of the loans, borrows and symbolic values. This is far from perfect, but
+       allows us to have a quite simple matching algorithm for now, to compute
+       the joins as well as to check whether two environments are equivalent.
+       We may want to make this algorithm more general in the future.
+    *)
+    let cmp abs0 abs1 =
+      match (abs0, abs1) with
+      | EAbs abs0, EAbs abs1 -> compare_tavalue_list abs0.avalues abs1.avalues
+      | _ -> [%internal_error] span
+    in
+    let fresh_abs = List.sort cmp fresh_abs |> List.rev in
 
-  (* Reconstruct the environment *)
-  let env = fresh_abs @ env in
-
-  { ctx with env }
+    (* Reconstruct the environment *)
+    let env = fresh_abs @ env in
+    { ctx with env }
 
 let reorder_fresh_abs (span : Meta.span) (allow_markers : bool)
     (old_abs_ids : AbsId.Set.t) (ctx : eval_ctx) : eval_ctx =

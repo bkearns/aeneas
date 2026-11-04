@@ -211,8 +211,77 @@ let apply_symbolic_expansion_to_target_aevalues (span : Meta.span)
             ESymbolic (pm, aproj)
     end
   in
-  (* Apply the expansion *)
-  obj#visit_eval_ctx None ctx
+  (* The expansion targets the projectors of one symbolic value, so it usually
+     applies to nothing, and when it applies it changes one element of the
+     environment. The context is large and the synthesis retains it (see the
+     comment on structure sharing in {!Contexts}), so count the projectors
+     first, rebuild the element which holds the only one if there is just one,
+     and fall back to a full rewrite otherwise. *)
+  let is_target_aproj (aproj : aproj) : bool =
+    match (aproj, proj_kind) with
+    | AProjLoans { proj; consumed = _; borrows = _ }, LoanProj
+    | AProjBorrows { proj; loans = _ }, BorrowProj -> proj.sv_id = original_sv.sv_id
+    | _ -> false
+  in
+  let is_target_eproj (eproj : eproj) : bool =
+    match (eproj, proj_kind) with
+    | EProjLoans { proj; consumed = _; borrows = _ }, LoanProj
+    | EProjBorrows { proj; loans = _ }, BorrowProj -> proj.sv_id = original_sv.sv_id
+    | _ -> false
+  in
+  let count_matches =
+    let n = ref 0 in
+    let visitor =
+      object
+        inherit [_] iter_eval_ctx as super
+
+        method! visit_aproj env aproj =
+          if is_target_aproj aproj then incr n;
+          super#visit_aproj env aproj
+
+        method! visit_eproj env eproj =
+          if is_target_eproj eproj then incr n;
+          super#visit_eproj env eproj
+      end
+    in
+    visitor#visit_eval_ctx () ctx;
+    !n
+  in
+  let elem_has_match =
+    let visitor =
+      object
+        inherit [_] iter_env as super
+
+        method! visit_aproj env aproj =
+          if is_target_aproj aproj then raise Utils.Found;
+          (* Nothing to do *)
+          super#visit_aproj env aproj
+
+        method! visit_eproj env eproj =
+          if is_target_eproj eproj then raise Utils.Found;
+          super#visit_eproj env eproj
+      end
+    in
+    fun (ee : env_elem) ->
+      try
+        visitor#visit_env_elem () ee;
+        false
+      with Utils.Found -> true
+  in
+  match count_matches with
+  | 0 -> ctx
+  | 1 ->
+      ctx_map_first_elem ctx (fun ee ->
+          if not (elem_has_match ee) then None
+          else
+            Some
+              (match ee with
+              | EAbs abs -> EAbs (obj#visit_abs None abs)
+              | EBinding (bv, v) -> EBinding (bv, obj#visit_tvalue None v)
+              | EFrame -> ee))
+  | _ ->
+      (* Apply the expansion *)
+      obj#visit_eval_ctx None ctx
 
 (** Auxiliary function. Apply a symbolic expansion to avalues in a context. *)
 let apply_symbolic_expansion_to_aevalues (span : Meta.span)

@@ -7,6 +7,64 @@ open Charon.Print
 open PrintBase.Values
 include ContextsBase
 
+(** **Structure sharing in environments.
+
+    The environments are large immutable values, and the synthesis keeps one
+    evaluation context per symbolic statement. A rewrite which rebuilds the
+    whole environment therefore makes every retained context cost a full copy,
+    so the memory kept by a translation grows with the number of statements
+    times the size of the function. The helpers below let a rewrite keep the
+    blocks it didn't change, so that a retained environment costs the part which
+    actually differs.
+
+    This is observationally transparent for all the values involved: they are
+    immutable, and no code relies on two structurally equal values being two
+    distinct blocks. *)
+
+(** [list_phys_eq l1 l2] is [l1 == l2], element by element: it only compares
+    pointers, so it costs the length of the list. *)
+let rec list_phys_eq (l1 : 'a list) (l2 : 'a list) : bool =
+  match (l1, l2) with
+  | [], [] -> true
+  | x1 :: tl1, x2 :: tl2 -> x1 == x2 && list_phys_eq tl1 tl2
+  | _ -> false
+
+(** [share_abs orig mapped] returns [orig] when [mapped] is the abstraction
+    [orig] with nothing changed in it.
+
+    The check is deliberately shallow — it compares the fields and the
+    pointers of the abstract values, never their contents — for two reasons:
+    the values of an abstraction can be large (they carry the continuations of
+    the translation), and the rewrites we short-circuit this way rebuild the
+    abstraction from the abstract values they are given, so "unchanged" shows
+    up as pointer equality of those values. A rewrite which rebuilt an
+    abstraction without changing it in a way this check cannot see is left
+    alone: it keeps its copy, which is a missed sharing opportunity, not a
+    wrong result. *)
+let share_abs (orig : abs) (mapped : abs) : abs =
+  if mapped == orig then orig
+  else if
+    mapped.abs_id == orig.abs_id
+    && mapped.kind = orig.kind
+    && mapped.can_end = orig.can_end
+    && mapped.parents == orig.parents
+    && mapped.regions == orig.regions
+    && mapped.ended_subabs == orig.ended_subabs
+    && mapped.cont == orig.cont
+    && list_phys_eq mapped.avalues orig.avalues
+  then orig
+  else mapped
+
+(** [map_list_share f l] is [List.map f l], but the returned list physically
+    shares every suffix of [l] which [f] leaves untouched. *)
+let rec map_list_share (f : 'a -> 'a) (l : 'a list) : 'a list =
+  match l with
+  | [] -> []
+  | x :: tl ->
+      let x' = f x in
+      let tl' = map_list_share f tl in
+      if x' == x && tl' == tl then l else x' :: tl'
+
 module OrderedBinder : Collections.OrderedType with type t = var_binder = struct
   type t = var_binder
 
@@ -286,7 +344,10 @@ let ctx_lookup_const_generic_value (ctx : eval_ctx) (vid : ConstGenericVarId.id)
 (** Update a variable's value in the current frame.
 
     This is a helper function: it can break invariants and doesn't perform any
-    check. *)
+    check.
+
+    Only the bindings up to the updated variable are rebuilt: the rest of the
+    environment is shared with [env]. *)
 let env_update_var_value (span : Meta.span) (env : env) (vid : LocalId.id)
     (nv : tvalue) : env =
   (* We take care to stop at the end of current frame: different variables
@@ -295,10 +356,14 @@ let env_update_var_value (span : Meta.span) (env : env) (vid : LocalId.id)
   let rec update env =
     match env with
     | [] -> [%craise] span "Unexpected"
-    | EBinding ((BVar b as var), v) :: env' ->
-        if b.index = vid then EBinding (var, nv) :: env'
-        else EBinding (var, v) :: update env'
-    | ((EBinding (BDummy _, _) | EAbs _) as ee) :: env' -> ee :: update env'
+    | EBinding ((BVar b as var), v) :: tl ->
+        if b.index = vid then EBinding (var, nv) :: tl
+        else
+          let env' = update tl in
+          if env' == tl then env else EBinding (var, v) :: env'
+    | ((EBinding (BDummy _, _) | EAbs _) as ee) :: tl ->
+        let env' = update tl in
+        if env' == tl then env else ee :: env'
     | EFrame :: _ -> [%craise] span "End of frame"
   in
   update env
@@ -431,23 +496,37 @@ let env_lookup_abs_opt (env : env) (abs_id : AbsId.id) : abs option =
 
 (** Remove an abstraction from the context, as well as all the references to
     this abstraction (for instance, remove the abs id from all the parent sets
-    of all the other abstractions). *)
+    of all the other abstractions).
+
+    The elements (and the suffixes) which are not affected by the removal are
+    shared with [env]: ending an abstraction leaves the rest of the environment
+    untouched, and the contexts which still refer to it are retained by the
+    synthesis. *)
 let env_remove_abs (span : Meta.span) (env : env) (abs_id : AbsId.id) :
     env * abs option =
   let rec remove (env : env) : env * abs option =
     match env with
     | [] -> [%craise] span "Unreachable"
     | EFrame :: _ -> (env, None)
-    | EBinding (bv, v) :: env ->
-        let env, abs_opt = remove env in
-        (EBinding (bv, v) :: env, abs_opt)
-    | EAbs abs :: env ->
-        if abs.abs_id = abs_id then (env, Some abs)
+    | EBinding (bv, v) :: tl ->
+        let env', abs_opt = remove tl in
+        let env' = if env' == tl then env else EBinding (bv, v) :: env' in
+        (env', abs_opt)
+    | EAbs abs :: tl ->
+        if abs.abs_id = abs_id then (tl, Some abs)
         else
-          let env, abs_opt = remove env in
+          let env', abs_opt = remove tl in
           (* Update the parents set *)
-          let parents = AbsId.Set.remove abs_id abs.parents in
-          (EAbs { abs with parents } :: env, abs_opt)
+          let abs' =
+            if AbsId.Set.mem abs_id abs.parents then
+              { abs with parents = AbsId.Set.remove abs_id abs.parents }
+            else abs
+          in
+          let env' =
+            if abs' == abs && env' == tl then env
+            else EAbs abs' :: env'
+          in
+          (env', abs_opt)
   in
   remove env
 
@@ -456,29 +535,37 @@ let env_remove_abs (span : Meta.span) (env : env) (abs_id : AbsId.id) :
     Note that we substitute an abstraction (identified by its id) with a
     different abstraction which **doesn't necessarily have the same id**.
     Because of this, we also substitute the abstraction id wherever it is used
-    (i.e., in the parent sets of the other abstractions). *)
+    (i.e., in the parent sets of the other abstractions).
+
+    As for {!env_remove_abs}, the parts of the environment which are not affected
+    are shared with [env]. *)
 let env_subst_abs (span : Meta.span) (env : env) (abs_id : AbsId.id)
     (nabs : abs) : env * abs option =
   let rec update (env : env) : env * abs option =
     match env with
     | [] -> [%craise] span "Unreachable"
     | EFrame :: _ -> (* We're done *) (env, None)
-    | EBinding (bv, v) :: env ->
-        let env, opt_abs = update env in
-        (EBinding (bv, v) :: env, opt_abs)
-    | EAbs abs :: env ->
-        if abs.abs_id = abs_id then (EAbs nabs :: env, Some abs)
+    | EBinding (bv, v) :: tl ->
+        let env', opt_abs = update tl in
+        let env' = if env' == tl then env else EBinding (bv, v) :: env' in
+        (env', opt_abs)
+    | EAbs abs :: tl ->
+        if abs.abs_id = abs_id then (EAbs nabs :: tl, Some abs)
         else
-          let env, opt_abs = update env in
+          let env', opt_abs = update tl in
           (* Update the parents set *)
           let parents = abs.parents in
-          let parents =
+          let abs' =
             if AbsId.Set.mem abs_id parents then
               let parents = AbsId.Set.remove abs_id parents in
-              AbsId.Set.add nabs.abs_id parents
-            else parents
+              { abs with parents = AbsId.Set.add nabs.abs_id parents }
+            else abs
           in
-          (EAbs { abs with parents } :: env, opt_abs)
+          let env' =
+            if abs' == abs && env' == tl then env
+            else EAbs abs' :: env'
+          in
+          (env', opt_abs)
   in
   update env
 
@@ -572,7 +659,7 @@ class ['self] map_eval_ctx =
     method visit_eval_ctx : 'acc -> eval_ctx -> eval_ctx =
       fun acc ctx ->
         let env = self#visit_env acc ctx.env in
-        { ctx with env }
+        if env == ctx.env then ctx else { ctx with env }
   end
 
 (** The elements in an environment are in reverse order *)
@@ -583,7 +670,7 @@ class ['self] map_eval_ctx_regular_order =
     method visit_eval_ctx : 'acc -> eval_ctx -> eval_ctx =
       fun acc ctx ->
         let env = List.rev (self#visit_env acc (List.rev ctx.env)) in
-        { ctx with env }
+        if env == ctx.env then ctx else { ctx with env }
   end
 
 let env_iter_abs (f : abs -> unit) (env : env) : unit =
@@ -602,13 +689,40 @@ let env_iter_abs_regular_order (f : abs -> unit) (env : env) : unit =
       | EAbs abs -> f abs)
     (List.rev env)
 
+(** Apply [f] to the abstractions of an environment, sharing everything [f]
+    leaves unchanged (see the comment on structure sharing at the top of this
+    file).
+
+    Most context-wide rewrites only change one abstraction, so this is what
+    keeps the cost of a retained environment proportional to what changed. *)
 let env_map_abs (f : abs -> abs) (env : env) : env =
-  List.map
+  map_list_share
     (fun (ee : env_elem) ->
       match ee with
       | EBinding _ | EFrame -> ee
-      | EAbs abs -> EAbs (f abs))
+      | EAbs abs ->
+          let abs' = share_abs abs (f abs) in
+          if abs' == abs then ee else EAbs abs')
     env
+
+(** Apply [f] to the first environment element on which it succeeds, and share
+    everything else with [env].
+
+    This is the single-point variant of {!env_map_abs}: the rewrites which update
+    one loan or one borrow (see {!InterpBorrowsCore}) know that at most one
+    element of the environment changes, so they must not rebuild the others. *)
+let env_map_first (f : env_elem -> env_elem option) (env : env) : env =
+  let rec map (env : env) : env =
+    match env with
+    | [] -> env
+    | ee :: tl -> (
+        match f ee with
+        | Some ee' -> ee' :: tl
+        | None ->
+            let tl' = map tl in
+            if tl' == tl then env else ee :: tl')
+  in
+  map env
 
 let env_filter_map_abs (f : abs -> 'a option) (env : env) : 'a list =
   List.filter_map
@@ -627,7 +741,15 @@ let env_filter_abs (f : abs -> bool) (env : env) : env =
     env
 
 let ctx_map_abs (f : abs -> abs) (ctx : eval_ctx) : eval_ctx =
-  { ctx with env = env_map_abs f ctx.env }
+  let env = env_map_abs f ctx.env in
+  if env == ctx.env then ctx else { ctx with env }
+
+(** Update at most one environment element, and share the rest of the
+    environment with [ctx]. See {!env_map_first}. *)
+let ctx_map_first_elem (ctx : eval_ctx) (f : env_elem -> env_elem option) :
+    eval_ctx =
+  let env = env_map_first f ctx.env in
+  if env == ctx.env then ctx else { ctx with env }
 
 let ctx_filter_abs (f : abs -> bool) (ctx : eval_ctx) : eval_ctx =
   { ctx with env = env_filter_abs f ctx.env }
