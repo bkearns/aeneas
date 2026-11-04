@@ -107,9 +107,9 @@ let concat_generic_args (generics1 : generic_args) (generics2 : generic_args) :
     This shadows {!Charon.TypesUtils.region_in_set}: we use sets of regions
     (which may contain the static region) rather than sets of region ids.
 
-    This function should be used on non-bound regions; it raises an exception if
-    this is not the case, or if the region is erased and [allow_erased] is
-    [false]. *)
+    A bound region is never in the set: the binder that owns it is part of the
+    type (a function item's own region arguments), not a region of the set's
+    signature. An erased region raises unless [allow_erased] is [true]. *)
 let region_in_set ?(allow_erased = false) (r : region) (rset : region_set) :
     bool =
   match r with
@@ -124,8 +124,10 @@ let region_in_set ?(allow_erased = false) (r : region) (rset : region_set) :
         "region_in_set shouldn't be called on body regions"
   | RLub _ -> [%craise_opt_span] None "Unexpected Lub region"
   | RVar (Bound _) ->
-      [%craise_opt_span] None
-        "region_in_set shouldn't be called on bound regions"
+      (* A bound region belongs to a binder inside the type -- the regions a
+         function item binds ([for<'a> f<'a>]), in the types this analysis sees
+         -- so it is never one of the regions of ours the set holds. *)
+      false
 
 (** Convert a set of region ids to a set of (free) regions *)
 let region_set_of_region_id_set (rids : RegionId.Set.t) : region_set =
@@ -153,8 +155,11 @@ let region_set_has_static (rset : region_set) : bool =
     contains ended regions, and the static region never ends (several region
     abstractions may own it at the same time - see [Contexts.eval_ctx]).
 
-    This function should be used on non-erased and non-bound regions. For
-    sanity, we raise exceptions if this is not the case. *)
+    Neither an erased region, a body region nor a bound region is a free region,
+    so each contributes nothing. This is what the callers want: an erased region
+    is the absence of a region, a body region belongs to a closure body, and a
+    bound region belongs to a binder inside the type (a function item's own
+    region arguments). *)
 let ty_regions (ty : ty) : RegionId.Set.t =
   let s = ref RegionId.Set.empty in
   let add_region (r : region) =
@@ -168,7 +173,9 @@ let ty_regions (ty : ty) : RegionId.Set.t =
            than abort: an erased region is the absence of a region, not an inconsistency. *)
         ()
     | RVar (Bound _) ->
-        raise (Failure "region_in_set shouldn't be called on bound regions")
+        (* Same: the binder that owns it is part of the type (a function item's
+           region arguments), not a region of the type's signature. *)
+        ()
     | RVar (Free id) -> s := RegionId.Set.add id !s
   in
   let obj =
@@ -558,6 +565,15 @@ let raise_if_not_rty_visitor =
       | RStatic | RVar (Free _) -> ()
       | RLub ty -> self#visit_ty () ty
       | RBody _ -> [%craise_opt_span] None "unsupported: Body region"
+
+    (* A function item binds the regions of its own arguments: [for<'a>
+       as_str<'a>]. They are instantiated afresh at every call, so they are not
+       regions of the type we are looking at -- the value of a function item is
+       zero-sized and borrows nothing -- and the interpreter must not treat them
+       as regions it tracks. Charon also leaves them erased when it cannot name
+       them. Visit the type arguments (which are ours) and stop there. *)
+    method! visit_TFnDef env fp =
+      List.iter (self#visit_ty env) fp.binder_value.generics.types
 
     method! visit_TDynTrait env tr =
       (* Ignore dyn traits by default *)

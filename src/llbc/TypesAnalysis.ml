@@ -508,28 +508,15 @@ let analyze_full_ty (span : Meta.span option) (updated : bool ref)
             ty_info inputs
         in
         analyze span expl_info ty_info output
-    | TFnDef { binder_regions; binder_value = { kind = _; generics }; _ } ->
-        (* For now we check that there are no regions anywhere.
-
-           TODO: the best would be to open all binders and then do a sanity
-           check (probably that no region bound at the level of the signature
-           is outlived by a locally bound region).
-         *)
-        [%cassert_opt_span] span (binder_regions = []) "Unimplemented";
-        let visitor =
-          object
-            inherit [_] iter_ty
-            method! visit_region _ _ = raise Utils.Found
-          end
-        in
-        let has_regions =
-          try
-            visitor#visit_generic_args () generics;
-            false
-          with Utils.Found -> true
-        in
-        [%cassert_opt_span] span (not has_regions) "Unimplemented";
-        ty_info
+    | TFnDef { binder_regions = _; binder_value = { kind = _; generics }; _ } ->
+        (* A function item used as a value (e.g. [String::as_str] passed to
+           [Iterator::map]). The regions the item binds are its own: they are
+           instantiated at every call, so they carry no borrow of ours and no
+           constraint on our regions. Only its type arguments can mention types
+           of this declaration, so explore those and stop. *)
+        List.fold_left
+          (fun ty_info ty -> analyze span expl_info ty_info ty)
+          ty_info generics.types
     | TError _ ->
         [%craise_opt_span] span "Found type error in the output of charon"
     | _ -> [%craise_opt_span] span ("unsupported type: " ^ show_ty ty)
@@ -1126,6 +1113,12 @@ let check_no_bound_free_implied_bounds (crate : crate) (span : Meta.span option)
                against [outer] by [visit_region], the type arguments are
                recursed into. *)
             super#visit_ty outer ty
+        | TFnDef { binder_value = { kind = _; generics }; _ } ->
+            (* A function item's regions are the ones it binds itself: at a call
+               they are instantiated afresh, so no constraint implied by this
+               declaration relates them to a region of ours. Its type arguments
+               are ours to check, though, so visit those and not the regions. *)
+            List.iter (self#visit_ty outer) generics.types
         | _ -> super#visit_ty outer ty
     end
   in

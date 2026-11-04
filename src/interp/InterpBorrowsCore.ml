@@ -2417,6 +2417,47 @@ let rec norm_proj_tys_union (span : Meta.span) ?(strict : bool = true)
         }
       in
       TFnPtr { binder_regions = []; outlives = outlives1; binder_value }
+  | ( TFnDef
+        { binder_value = { kind = kind1; generics = generics1 }; _ },
+      TFnDef
+        { binder_value = { kind = kind2; generics = generics2 }; _ } )
+    when kind1 = kind2
+         && List.length generics1.regions = List.length generics2.regions ->
+      (* Two uses of the same function item. The regions the item binds are its
+         own -- no borrow of ours is ever projected onto them -- so whatever
+         either side says about them, the union projects nothing there. The type
+         arguments are ours, though, so they are unioned as usual. *)
+      if
+        List.length generics1.types <> List.length generics2.types
+        || List.length generics1.const_generics
+           <> List.length generics2.const_generics
+        || List.length generics1.trait_refs <> List.length generics2.trait_refs
+      then [%internal_error] span;
+      TFnDef
+        {
+          binder_regions = [];
+          outlives = [];
+          binder_value =
+            {
+              kind = kind1;
+              generics =
+                {
+                  regions = List.map (fun _ -> RErased) generics1.regions;
+                  types =
+                    List.map2
+                      (norm_proj_tys_union span ctx ~strict)
+                      generics1.types generics2.types;
+                  const_generics =
+                    List.map2
+                      (norm_proj_const_generics_union span)
+                      generics1.const_generics generics2.const_generics;
+                  trait_refs =
+                    List.map2
+                      (norm_proj_poly_trait_refs_union span)
+                      generics1.trait_refs generics2.trait_refs;
+                };
+            };
+        }
   | TArray (ty0, len0, _), TArray (ty1, len1, _) ->
       [%sanity_check] span (len0 = len1);
       TArray (norm_proj_tys_union span ~strict ctx ty0 ty1, len0, None)

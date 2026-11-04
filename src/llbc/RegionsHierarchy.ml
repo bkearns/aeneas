@@ -292,28 +292,15 @@ let compute_regions_hierarchy_for_sig (span : Meta.span option) (crate : crate)
         (* We can ignore the outer regions *)
         let { Types.inputs; output; _ } = binder.binder_value in
         List.iter (explore_ty []) (output :: inputs)
-    | TFnDef { binder_regions; binder_value = { kind = _; generics }; _ } ->
-        (* For now we check that there are no regions anywhere.
-
-           TODO: the best would be to open all binders and then do a sanity
-           check (probably that no region bound at the level of the signature
-           is outlived by a locally bound region).
-         *)
-        [%cassert_opt_span] span (binder_regions = []) "Unimplemented";
-        let visitor =
-          object
-            inherit [_] iter_ty
-            method! visit_region _ _ = raise Utils.Found
-          end
-        in
-        let has_regions =
-          try
-            visitor#visit_generic_args () generics;
-            false
-          with Utils.Found -> true
-        in
-        [%cassert_opt_span] span (not has_regions) "Unimplemented";
-        ()
+    | TFnDef { binder_regions = _; binder_value = { kind = _; generics }; _ } ->
+        (* A function item used as a value (e.g. [String::as_str] passed to
+           [Iterator::map]). The regions it binds are its own: at a call they are
+           instantiated afresh, so they never appear in the region hierarchy of
+           the signature we are computing -- [add_edge] already ignores bound
+           regions. Its type arguments, however, are given by the signature and
+           may mention the signature's own types, so explore those. *)
+        List.iter (fun ty -> explore_ty outer ty) generics.types;
+        ();
     | TDynTrait _ ->
         [%cassert_opt_span] span Config.type_analysis_ignore_dyn "Unimplemented"
     | TError _ ->

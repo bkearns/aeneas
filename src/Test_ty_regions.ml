@@ -5,9 +5,12 @@
    legitimately mention a region that is not free. Aborting on those answers a question the
    caller never asked, and takes the whole run with it.
 
-   The three outcomes are pinned here together, because the fix must widen the accepted input
-   without widening the accepted inconsistency: [RVar (Bound _)] reaching a free-region collector
-   is a real bug and must keep raising.
+   A third kind of region is legitimate in a type this collector sees: a bound one, where a
+   function item binds the regions of its own arguments ([for<'a> String::as_str<'a>], as it
+   appears inside [Map<Iter<String>, …>] once [impl Iterator] has been resolved). The binder is
+   part of the type, and its regions are instantiated afresh at every call, so they are not
+   regions of this signature either. All three are therefore skipped, and only the free regions
+   are reported.
 
    Run with `dune build @runtest` from src/. *)
 
@@ -51,11 +54,14 @@ let expect_returned name (f : unit -> RegionId.Set.t) (expected : int list) =
         (Error (Printf.sprintf "raised Failure(%S); expected no exception" m))
 
 let expect_raise name (f : unit -> RegionId.Set.t) =
+  (* Any exception is a refusal, which is what this control is about; the report names the one
+     that was raised so a change of exception is visible rather than silently accepted. *)
   match f () with
   | s ->
       report name
-        (Error (Printf.sprintf "returned %s; expected a Failure" (describe s)))
-  | exception Failure _ -> report name (Ok "raised Failure, as required")
+        (Error (Printf.sprintf "returned %s; expected an exception" (describe s)))
+  | exception e ->
+      report name (Ok (Printf.sprintf "raised %s, as required" (Printexc.to_string e)))
 
 let () =
   (* An erased region is not a free region: it must be skipped, not abort the caller. *)
@@ -89,9 +95,20 @@ let () =
   expect_returned "nested erased regions are skipped"
     (fun () -> TypesUtils.ty_regions (TRef (RErased, ref_to RErased, RMut)))
     [];
-  (* The fix must not swallow the inconsistency it was never about. *)
-  expect_raise "bound region still raises" (fun () ->
-      TypesUtils.ty_regions (ref_to (bound 9)));
+  (* A bound region belongs to a binder inside the type, not to this signature: a function item
+     binds its own, and instantiates them at every call. Skip it, as for an erased or body one. *)
+  expect_returned "bound region is skipped"
+    (fun () -> TypesUtils.ty_regions (ref_to (bound 9)))
+    [];
+  (* The positive control still holds next to it: a free region is collected even when the same
+     type also mentions a bound one. *)
+  expect_returned "free region beside a bound one is still collected"
+    (fun () -> TypesUtils.ty_regions (TRef (free 4, ref_to (bound 9), RShared)))
+    [ 4 ];
+  (* The fix must not swallow the inconsistency it was never about: a Lub region is a
+     least-upper-bound constraint, not a region of the signature, and stays an error. *)
+  expect_raise "Lub region still raises" (fun () ->
+      TypesUtils.ty_regions (ref_to (RLub scalar)));
 
   if !failures = 0 then (
     Printf.printf "\nty_regions: all contracts hold\n";

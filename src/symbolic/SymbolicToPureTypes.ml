@@ -403,7 +403,10 @@ let rec translate_fwd_ty (span : Meta.span option) (decls_ctx : C.decls_ctx)
       let trait_ref = translate_fwd_trait_ref span decls_ctx trait_ref in
       TTraitType (trait_ref, type_name)
   | TFnDef { binder_regions; binder_value = { kind; generics }; _ } -> (
-      [%cassert_opt_span] span (binder_regions = []) "Unimplemented";
+      (* A function item used as a type. The regions it binds are its own and are
+         instantiated at every call, so they relate to nothing here; the pure
+         encoding erases regions anyway. Its type and const arguments are ours. *)
+      ignore binder_regions;
       let generics = translate_fwd_generic_args span decls_ctx generics in
       match kind with
       | T.Fun fid ->
@@ -543,7 +546,12 @@ and compute_back_ty_num_levels (span : Meta.span option)
         (* No assert on the projection's generic arguments: they carry no regions of their own
            here, and the projection is handled the same way at every instantiation. *)
         save_count outer_regions
-    | TFnDef _ | TFnPtr _ ->
+    | TFnDef _ ->
+        (* A function item used as a type. It carries no borrow of ours: the
+           regions it binds are its own, instantiated at every call, so it
+           introduces no level of sub-abstraction. *)
+        save_count outer_regions
+    | TFnPtr _ ->
         [%craise_opt_span] span "Arrow types are not supported yet"
     | TDynTrait _ ->
         [%craise_opt_span] span "Dynamic trait types are not supported yet"
@@ -677,7 +685,12 @@ and translate_back_ty_aux (span : Meta.span option) (decls_ctx : C.decls_ctx)
         (* No assert on the projection's generic arguments: they carry no regions of their own
            here, and the projection is handled the same way at every instantiation. *)
         stop outer_regions ty
-    | TFnDef _ | TFnPtr _ ->
+    | TFnDef _ ->
+        (* A function item used as a type. It borrows nothing we own, so it is
+           never consumed or given back by a backward function; translate it as
+           a forward type, as for a raw pointer. *)
+        stop outer_regions ty
+    | TFnPtr _ ->
         [%craise_opt_span] span "Arrow types are not supported yet"
     | TDynTrait _ ->
         [%craise_opt_span] span "Dynamic trait types are not supported yet"
