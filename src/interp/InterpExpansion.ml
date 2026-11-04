@@ -319,10 +319,37 @@ let replace_symbolic_values (span : Meta.span) (at_most_once : bool)
         else super#visit_VSymbolic env spc
     end
   in
+  (* This is the fork of the synthesis: each arm of a branch point substitutes
+     the value it was taken on into the context the scrutinee was read in, so
+     every arm derives its context from the same one. Only the elements which
+     mention the value change — the binding which holds it, and the abstractions
+     whose values project into it — so walk them and share the rest, instead of
+     rebuilding the whole environment once per arm. A branch point that ends in
+     thousands of arms is a copy of the environment per arm otherwise. *)
+  let mentions =
+    let visitor =
+      object
+        inherit [_] iter_env as super
+
+        method! visit_VSymbolic env spc =
+          if same_symbolic_id spc original_sv then raise Utils.Found;
+          super#visit_VSymbolic env spc
+      end
+    in
+    fun (ee : env_elem) ->
+      try
+        visitor#visit_env_elem () ee;
+        false
+      with Utils.Found -> true
+  in
+  let rewrite (ee : env_elem) : env_elem =
+    match ee with
+    | EBinding (bv, v) -> EBinding (bv, obj#visit_tvalue None v)
+    | EAbs abs -> EAbs (share_abs abs (obj#visit_abs None abs))
+    | EFrame -> ee
+  in
   (* Apply the substitution *)
-  let ctx = obj#visit_eval_ctx None ctx in
-  (* Return *)
-  ctx
+  Contexts.ctx_map_matching mentions rewrite ctx
 
 let apply_symbolic_expansion_non_borrow (span : Meta.span)
     (original_sv : symbolic_value) (ctx : eval_ctx)

@@ -157,11 +157,122 @@ let test_single_element_update_shares () =
        delta env_words target_words)
     (delta < (env_words / 2) + target_words)
 
+(* --- Forking a context ---------------------------------------------------------
+
+   The arms of a branch point each get a context of their own, derived from the
+   one the scrutinee was read in by substituting the value the arm was taken on
+   (see {!InterpExpansion}). That derivation is the fork, and it is a different
+   path from the rewrites above: a substitution is not an abstraction rewrite, it
+   rewrites whichever environment *elements* mention the substituted value.
+
+   What it must cost is the same thing: an arm's context must not be a copy of
+   the whole environment, or a branch point that ends in [w] contexts costs [w]
+   copies. Substituting one value rewrites a handful of elements -- the binding
+   that holds it, and the abstractions whose values mention it -- so the rest of
+   the environment has to be the blocks the parent already holds. *)
+
+(** A copy of an environment element at the granularity a substitution rebuilds
+    it at: a fresh element, a fresh list of abstract values, and fresh abstract
+    value records. The values they hold are the ones it was given. *)
+let copy_elem (ee : Values.env_elem) : Values.env_elem =
+  match ee with
+  | Values.EBinding _ | Values.EFrame -> ee
+  | Values.EAbs abs ->
+      Values.EAbs
+        { abs with
+          avalues =
+            List.map
+              (fun (av : Values.tavalue) ->
+                ({ Values.value = av.value; ty = av.ty } : Values.tavalue))
+              abs.avalues }
+
+(* Forking must retain the elements the substitution changed, not the
+   environment. This is the number that decides whether a wide branch point is
+   affordable: it is what one more path costs on top of the one before it. *)
+let test_fork_retains_only_what_it_rewrites () =
+  let env = mk_env 128 in
+  let target = List.hd env in
+  let env_words = retained_words env in
+  let target_words = retained_words target in
+  let forked =
+    Contexts.env_map_matching (fun ee -> ee == target) copy_elem env
+  in
+  (* The substitution happened: the arm's copy of the element is not the parent's
+     block. *)
+  check "the targeted element is a fresh block after the fork"
+    (List.hd forked != target);
+  let delta = retained_words (env, forked) - env_words in
+  check
+    (Printf.sprintf
+       "forking retains %d words on top of the parent environment (%d words for \
+        the whole environment, %d for the element the substitution rewrote) — it \
+        must retain the elements it rewrote, not a second environment"
+       delta env_words target_words)
+    (delta < (env_words / 4) + target_words)
+
+(* The same property in the form that matters for a wide branch point: what one
+   fork costs must not grow with the size of the environment it forks. *)
+let test_fork_retained_delta_scaling () =
+  let delta_for n_abs =
+    let env = mk_env n_abs in
+    let target = List.hd env in
+    let env_words = retained_words env in
+    let forked =
+      Contexts.env_map_matching (fun ee -> ee == target) copy_elem env
+    in
+    retained_words (env, forked) - env_words
+  in
+  let small = delta_for 16 in
+  let large = delta_for 256 in
+  check
+    (Printf.sprintf
+       "forking retains %d words with 16 abstractions and %d words with 256 — \
+        the retained cost must not scale with the environment"
+       small large)
+    (large <= (2 * small) + 64)
+
+(* A substitution rewrites the elements which mention the value it substitutes,
+   and must not even look at the others. *)
+let test_fork_rewrites_only_the_matching_elements () =
+  let env = mk_env 16 in
+  let target = List.nth env 5 in
+  let rewritten = ref 0 in
+  let forked =
+    Contexts.env_map_matching
+      (fun ee -> ee == target)
+      (fun ee ->
+        incr rewritten;
+        copy_elem ee)
+      env
+  in
+  check
+    (Printf.sprintf "the fork rewrote %d elements of 16, it must rewrite one"
+       !rewritten)
+    (!rewritten = 1);
+  let others_shared =
+    List.for_all2
+      (fun before after -> before == target || before == after)
+      env forked
+  in
+  check "every element the fork did not rewrite is the parent's block"
+    others_shared
+
+(* A fork which rewrites nothing is not a fork: the context is the parent's. *)
+let test_fork_without_matches_is_the_original () =
+  let env = mk_env 32 in
+  let same = Contexts.env_map_matching (fun _ -> false) copy_elem env in
+  check "a fork which matches nothing returns the environment unchanged"
+    (same == env)
+
 let () =
   test_retained_delta_is_independent_of_env_size ();
   test_retained_delta_scaling ();
   test_unchanged_env_is_the_original ();
   test_single_element_update_shares ();
+  test_fork_retains_only_what_it_rewrites ();
+  test_fork_retained_delta_scaling ();
+  test_fork_rewrites_only_the_matching_elements ();
+  test_fork_without_matches_is_the_original ();
   if !failures = 0 then Printf.printf "test_ctx_sharing: all checks passed\n"
   else begin
     Printf.printf "test_ctx_sharing: %d check(s) failed\n" !failures;

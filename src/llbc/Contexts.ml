@@ -724,6 +724,30 @@ let env_map_first (f : env_elem -> env_elem option) (env : env) : env =
   in
   map env
 
+(** Apply [f] to the environment elements which [matches] accepts.
+
+    A substitution rewrites whichever elements mention the value it substitutes,
+    so it cannot be expressed with {!env_map_abs}: the unit of change is the
+    element, and an element may be a binding. [matches] is the test the caller
+    already performs to find them.
+
+    Everything [matches] rejects is returned as it was, and so are the suffixes
+    after the last element it accepts: what the caller retains is the elements it
+    rewrote, plus one cons cell per element before the last of them, instead of a
+    second environment. This is the fork path of the synthesis -- the arms of a
+    branch point each derive their context from the same one -- so it is the
+    difference between a wide branch point costing a copy of the environment per
+    arm and costing the handful of elements the arm's value touched. *)
+let env_map_matching (matches : env_elem -> bool) (f : env_elem -> env_elem)
+    (env : env) : env =
+  map_list_share (fun (ee : env_elem) -> if matches ee then f ee else ee) env
+
+(** The same, for a whole context: [ctx] itself when nothing matched. *)
+let ctx_map_matching (matches : env_elem -> bool) (f : env_elem -> env_elem)
+    (ctx : eval_ctx) : eval_ctx =
+  let env = env_map_matching matches f ctx.env in
+  if env == ctx.env then ctx else { ctx with env }
+
 let env_filter_map_abs (f : abs -> 'a option) (env : env) : 'a list =
   List.filter_map
     (fun (ee : env_elem) ->
