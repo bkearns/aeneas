@@ -311,6 +311,16 @@
   (run ./test_mem_report.exe)))
 
 (executable
+ (name test_trace_discard)
+ (modules Test_trace_discard)
+ (libraries aeneas))
+
+(rule
+ (alias runtest)
+ (action
+  (run ./test_trace_discard.exe)))
+
+(executable
  (name test_trace_ring)
  (modules Test_trace_ring)
  (libraries aeneas))

@@ -135,6 +135,8 @@ val join_ctxs_list :
   Meta.span ->
   abs_kind ->
   ?preprocess_first_ctx:bool ->
+  ?preprocess:(eval_ctx -> eval_ctx) ->
+  ?keep_ctxs:bool ->
   recoverable:bool ->
   with_abs_conts:bool ->
   eval_ctx list ->
@@ -157,12 +159,9 @@ val join_ctxs_list :
     - [old_ctx]
     - [ctxl] *)
 val loop_join_origin_with_continue_ctxs :
-  config ->
-  Meta.span ->
-  loop_id ->
-  eval_ctx ->
-  eval_ctx list ->
-  (eval_ctx * eval_ctx list) * eval_ctx
+  config -> Meta.span -> loop_id -> eval_ctx -> eval_ctx list -> eval_ctx
+(** The joined context, and only it: the rewritten contexts along the way are dead as soon
+    as they have been joined, and a list of them is a copy of every path's environment. *)
 
 (** Match a context with a target context.
 
@@ -340,6 +339,22 @@ val loop_join_break_ctxs :
   loop_id ->
   AbsId.Set.t ->
   DummyVarId.Set.t ->
+  eval_ctx list ->
+  eval_ctx
+
+(** Join further contexts at a break into an already joined one.
+
+    The caller has the contexts in batches -- the break contexts are computed by evaluating
+    the loop body twice -- and a context at a break is a whole environment. Joining each
+    batch when it is produced is what keeps the two batches from being in memory together,
+    which is two copies of every path's environment rather than one. *)
+val loop_join_break_ctxs_more :
+  config ->
+  Meta.span ->
+  loop_id ->
+  AbsId.Set.t ->
+  DummyVarId.Set.t ->
+  eval_ctx ->
   eval_ctx list ->
   eval_ctx
 

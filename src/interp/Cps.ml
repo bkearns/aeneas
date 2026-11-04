@@ -37,6 +37,51 @@ type stl_cm_fun =
 (** Compose continuations that we use to compute execution traces *)
 let cc_comp (f : 'b -> 'c) (g : 'a -> 'b) : 'a -> 'c = fun e -> f (g e)
 
+(** Whether the caller of a statement evaluation will consume the trace it builds.
+
+    Evaluating a statement returns the contexts it ends in *and* a continuation that
+    rebuilds the symbolic AST. The continuation is a chain of closures, one per statement
+    evaluated, and each closure keeps the evaluation context it was built with alive: an
+    environment is a few hundred bindings, so the chain costs memory proportional to the
+    number of statements in the body rather than to the size of its result. Some passes
+    never use the trace -- the search for a loop fixed point evaluates a body repeatedly
+    only to learn where it goes and how the context evolves, and drops the trace every
+    time -- and on a body of 10^5 statements that discarded chain is the largest thing in
+    the heap. Those passes run under {!without_trace}, and {!trace_needed} tells
+    {!InterpStatements.eval_statement_list} to compose nothing.
+
+    Domain-local rather than a [Config] flag: functions are translated in parallel, so a
+    global switch would silence the trace of every other function too. *)
+let trace_needed_key : bool Domain.DLS.key = Domain.DLS.new_key (fun () -> true)
+
+(** Whether the caller will consume the execution trace. *)
+let trace_needed () : bool = Domain.DLS.get trace_needed_key
+
+(** Run [f] in a state where the trace is not needed. Restored on exception, so a failure
+    inside a loop body does not leave the rest of the translation with no trace. *)
+let without_trace (f : unit -> 'a) : 'a =
+  let previous = Domain.DLS.get trace_needed_key in
+  Domain.DLS.set trace_needed_key false;
+  Fun.protect
+    ~finally:(fun () -> Domain.DLS.set trace_needed_key previous)
+    f
+
+(** Compose the trace of one statement with the trace of the rest of the block.
+
+    This is where a statement's node joins the chain, so it is also where a pass that does
+    not want the chain says so: rather than returning `cf_st1` composed with `cf_st2` --
+    which keeps the statement's context reachable for as long as the caller holds the
+    trace -- it returns a continuation that would fail if applied, exactly as
+    {!InterpLoops.eval_loop_concrete} does. Callers that discard the trace never apply it,
+    so the difference is invisible in the result and it is the difference between O(1) and
+    O(statements) live contexts.
+
+    Kept polymorphic in the expression type so that this module does not need to know
+    about the symbolic AST. *)
+let compose_trace (span : Meta.span) (cf_st1 : 'b -> 'c) (cf_st2 : 'a -> 'b) : 'a -> 'c
+    =
+  if trace_needed () then cc_comp cf_st1 cf_st2 else fun _ -> [%internal_error] span
+
 let comp (f : 'b -> 'c) (g : 'x * ('a -> 'b)) : 'x * ('a -> 'c) =
   let x, g = g in
   (x, cc_comp f g)

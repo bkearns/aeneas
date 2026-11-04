@@ -922,9 +922,9 @@ let join_ctxs (span : Meta.span) (fresh_abs_kind : abs_kind)
   with ValueMatchFailure e -> Error e
 
 let join_ctxs_list (config : config) (span : Meta.span)
-    (fresh_abs_kind : abs_kind) ?(preprocess_first_ctx : bool = true)
-    ~(recoverable : bool) ~(with_abs_conts : bool) (ctxl : eval_ctx list) :
-    eval_ctx list * eval_ctx =
+    (fresh_abs_kind : abs_kind) ?(preprocess_first_ctx : bool = true) ?preprocess
+    ?(keep_ctxs : bool = true) ~(recoverable : bool) ~(with_abs_conts : bool)
+    (ctxl : eval_ctx list) : eval_ctx list * eval_ctx =
   (* The list of contexts should be non empty *)
   let ctx0, ctxl =
     match ctxl with
@@ -944,7 +944,14 @@ let join_ctxs_list (config : config) (span : Meta.span)
     ctx
   in
 
-  let ctx0 = if preprocess_first_ctx then preprocess_ctx ctx0 else ctx0 in
+  (* [preprocess] is what a caller wants its contexts to be brought into before joining
+     them, and it is applied *as each context is reached*, not to the whole list up front:
+     a preprocessed context is a full copy of an environment, so preparing a list of them
+     holds twice the memory the join needs, for copies that are dead as soon as they have
+     been joined. *)
+  let preprocess = match preprocess with Some f -> f | None -> preprocess_ctx in
+
+  let ctx0 = if preprocess_first_ctx then preprocess ctx0 else ctx0 in
 
   (* # Join with the new contexts, one by one
 
@@ -985,7 +992,7 @@ let join_ctxs_list (config : config) (span : Meta.span)
       "join_one: initial ctx:\n" ^ eval_ctx_to_string ~span:(Some span) ctx];
 
     (* Simplify the dummy values *)
-    let ctx = preprocess_ctx ctx in
+    let ctx = preprocess ctx in
 
     (* Join the two contexts  *)
     let ctx1 = join_one_aux ctx in
@@ -1007,9 +1014,14 @@ let join_ctxs_list (config : config) (span : Meta.span)
     ctx1
   in
 
-  let ctxl = List.map join_one ctxl in
-
   (* # Return *)
+  let ctxl =
+    if keep_ctxs then List.map join_one ctxl
+    else begin
+      List.iter (fun ctx -> ignore (join_one ctx)) ctxl;
+      []
+    end
+  in
   (ctx0 :: ctxl, !joined_ctx)
 
 (** Destructure all the new abstractions *)
@@ -1037,8 +1049,7 @@ let destructure_new_abs (span : Meta.span) (old_abs_ids : AbsId.Set.t)
   ctx
 
 let loop_join_origin_with_continue_ctxs (config : config) (span : Meta.span)
-    (loop_id : LoopId.id) (ctx0 : eval_ctx) (ctxl : eval_ctx list) :
-    (eval_ctx * eval_ctx list) * eval_ctx =
+    (loop_id : LoopId.id) (ctx0 : eval_ctx) (ctxl : eval_ctx list) : eval_ctx =
   (* Simplify the contexts we want to join *)
   let simplify (ctx : eval_ctx) : eval_ctx =
     let fixed_aids = compute_fixed_abs_ids ctx0 ctx in
@@ -1071,56 +1082,134 @@ let loop_join_origin_with_continue_ctxs (config : config) (span : Meta.span)
     ctx
   in
 
-  let ctxl = List.map simplify ctxl in
+  (* The contexts are preprocessed one at a time, by [join_ctxs_list], and the per-context
+     results are not built: this computes a fixed point, and the caller of the fixed point
+     has no use for the contexts the join rewrote on the way. *)
+  join_ctxs_list config span (Loop loop_id) ~preprocess:simplify
+    ~preprocess_first_ctx:false ~keep_ctxs:false ~recoverable:false
+    ~with_abs_conts:false (ctx0 :: ctxl)
+  |> snd
 
-  let ctxl', joined_ctx =
-    join_ctxs_list config span (Loop loop_id) ~preprocess_first_ctx:false
-      ~recoverable:false ~with_abs_conts:false (ctx0 :: ctxl)
+(** Bring one context at the break into the shape the join expects: no useless dummies, the
+    abstractions introduced inside the body destructured, and the context reduced. *)
+let loop_join_break_ctxs_prepare (config : config) (span : Meta.span)
+    (loop_id : LoopId.id) (fixed_aids : AbsId.Set.t)
+    (fixed_dids : DummyVarId.Set.t) (ctx : eval_ctx) : eval_ctx =
+  [%ltrace
+    "prepate_ctx: initial ctx:\n" ^ eval_ctx_to_string ~span:(Some span) ctx];
+
+  (* Simplify the dummy values, by removing as many as we can -
+     we ignore the synthesis continuation *)
+  let ctx, _ = simplify_dummy_values_useless_abs config span ctx in
+  [%ltrace
+    "prepare_ctx: after simplify_dummy_values_useless_abs:\n"
+    ^ eval_ctx_to_string ~span:(Some span) ctx];
+
+  (* Destructure the abstractions introduced in the new context *)
+  let ctx = destructure_new_abs span fixed_aids ctx in
+  [%ltrace
+    "prepare_ctx: after destructure:\n" ^ eval_ctx_to_string ~span:(Some span) ctx];
+
+  (* Reduce the context we want to add to the join *)
+  let ctx =
+    reduce_ctx config span ~with_abs_conts:false (Loop loop_id) fixed_aids
+      fixed_dids ctx
   in
-  [%sanity_check] span (List.length ctxl' = List.length ctxl + 1);
-  ((List.hd ctxl', List.tl ctxl'), joined_ctx)
+  [%ltrace
+    "prepare_ctx: after reduce:\n" ^ eval_ctx_to_string ~span:(Some span) ctx];
+  (* Sanity check *)
+  if !Config.sanity_checks then Invariants.check_invariants span ctx;
+
+  ctx
+
+(** Join a batch of contexts at a break into [joined_ctx], one at a time.
+
+    Each context is prepared as it is reached and dropped once joined: preparing a batch
+    up front, or keeping the batch around while it is joined, holds a whole environment per
+    path on top of the join itself. *)
+let loop_join_break_ctxs_join (config : config) (span : Meta.span)
+    (loop_id : LoopId.id) (fixed_aids : AbsId.Set.t)
+    (fixed_dids : DummyVarId.Set.t) (joined_ctx : eval_ctx ref)
+    (ctxl : eval_ctx list) : unit =
+  let with_abs_conts = false in
+  let fresh_abs_kind : abs_kind = Loop loop_id in
+
+  (* # Join the contexts, one by one.
+
+     For every context, we repeteadly attempt to join it with the current
+     result of the join: if we fail (because we need to end loans for instance),
+     we update the context and retry.
+  *)
+  let rec join_one_aux (ctx : eval_ctx) =
+    match
+      join_ctxs span fresh_abs_kind ~recoverable:false ~with_abs_conts !joined_ctx
+        ctx
+    with
+    | Ok { joined_ctx = nctx; _ } ->
+        joined_ctx := nctx;
+        ctx
+    | Error err ->
+        let ctx =
+          (* TODO: simplify *)
+          match err with
+          | LoanInRight bid ->
+              InterpBorrows.end_loan_no_synth config span bid ctx
+          | LoansInRight bids ->
+              InterpBorrows.end_loans_no_synth config span bids ctx
+          | LoanInLeft bid ->
+              joined_ctx :=
+                InterpBorrows.end_loan_no_synth config span bid !joined_ctx;
+              ctx
+          | LoansInLeft bids ->
+              joined_ctx :=
+                InterpBorrows.end_loans_no_synth config span bids !joined_ctx;
+              ctx
+          | AbsInRight _ | AbsInLeft _ -> [%craise] span "Unexpected"
+        in
+        join_one_aux ctx
+  in
+  let join_one (ctx : eval_ctx) =
+    (* Join the two contexts  *)
+    let ctx1 = join_one_aux ctx in
+    [%ltrace
+      "join_one: after join:\n" ^ eval_ctx_to_string ~span:(Some span) ctx1];
+
+    (* Collapse to eliminate the markers *)
+    joined_ctx :=
+      collapse_ctx config span fresh_abs_kind ~recoverable:false ~with_abs_conts
+        !joined_ctx;
+    [%ltrace
+      "join_one: after join-collapse:\n"
+      ^ eval_ctx_to_string ~span:(Some span) !joined_ctx];
+    (* Sanity check *)
+    if !Config.sanity_checks then Invariants.check_invariants span !joined_ctx;
+
+    (* Reduce (it helps matching afterwards) *)
+    joined_ctx :=
+      reduce_ctx config span ~with_abs_conts fresh_abs_kind fixed_aids fixed_dids
+        !joined_ctx;
+    [%ltrace
+      "join_one: after last reduce:\n"
+      ^ eval_ctx_to_string ~span:(Some span) !joined_ctx];
+
+    (* Sanity check *)
+    if !Config.sanity_checks then Invariants.check_invariants span !joined_ctx
+  in
+  List.iter
+    (fun ctx ->
+      join_one
+        (loop_join_break_ctxs_prepare config span loop_id fixed_aids fixed_dids ctx))
+    ctxl
 
 let loop_join_break_ctxs (config : config) (span : Meta.span)
     (loop_id : LoopId.id) (fixed_aids : AbsId.Set.t)
     (fixed_dids : DummyVarId.Set.t) (ctxl : eval_ctx list) : eval_ctx =
-  (* Simplify the contexts *)
-  let with_abs_conts = false in
-  let fresh_abs_kind : abs_kind = Loop loop_id in
-  let prepare_ctx (ctx : eval_ctx) : eval_ctx =
-    [%ltrace
-      "prepate_ctx: initial ctx:\n" ^ eval_ctx_to_string ~span:(Some span) ctx];
-
-    (* Simplify the dummy values, by removing as many as we can -
-       we ignore the synthesis continuation *)
-    let ctx, _ = simplify_dummy_values_useless_abs config span ctx in
-    [%ltrace
-      "prepare_ctx: after simplify_dummy_values_useless_abs:\n"
-      ^ eval_ctx_to_string ~span:(Some span) ctx];
-
-    (* Destructure the abstractions introduced in the new context *)
-    let ctx = destructure_new_abs span fixed_aids ctx in
-    [%ltrace
-      "prepare_ctx: after destructure:\n"
-      ^ eval_ctx_to_string ~span:(Some span) ctx];
-
-    (* Reduce the context we want to add to the join *)
-    let ctx =
-      reduce_ctx config span ~with_abs_conts:false (Loop loop_id) fixed_aids
-        fixed_dids ctx
-    in
-    [%ltrace
-      "prepare_ctx: after reduce:\n" ^ eval_ctx_to_string ~span:(Some span) ctx];
-    (* Sanity check *)
-    if !Config.sanity_checks then Invariants.check_invariants span ctx;
-
-    ctx
-  in
-  let ctxl = List.map prepare_ctx ctxl in
-
   match ctxl with
   | [] -> [%internal_error] span
   | [ ctx ] ->
-      (* Special case: simply remove the continuation expressions from the fresh abs *)
+      let ctx =
+        loop_join_break_ctxs_prepare config span loop_id fixed_aids fixed_dids ctx
+      in
       let update (e : env_elem) : env_elem =
         match (e : env_elem) with
         | EAbs abs ->
@@ -1130,76 +1219,30 @@ let loop_join_break_ctxs (config : config) (span : Meta.span)
       in
       { ctx with env = List.map update ctx.env }
   | ctx :: ctxl ->
-      let joined_ctx = ref ctx in
-
-      (* # Join the contexts, one by one.
-
-          For every context, we repeteadly attempt to join it with the current
-          result of the join: if we fail (because we need to end loans for instance),
-          we update the context and retry.
-       *)
-      let rec join_one_aux (ctx : eval_ctx) =
-        match
-          join_ctxs span fresh_abs_kind ~recoverable:false ~with_abs_conts
-            !joined_ctx ctx
-        with
-        | Ok { joined_ctx = nctx; _ } ->
-            joined_ctx := nctx;
-            ctx
-        | Error err ->
-            let ctx =
-              (* TODO: simplify *)
-              match err with
-              | LoanInRight bid ->
-                  InterpBorrows.end_loan_no_synth config span bid ctx
-              | LoansInRight bids ->
-                  InterpBorrows.end_loans_no_synth config span bids ctx
-              | LoanInLeft bid ->
-                  joined_ctx :=
-                    InterpBorrows.end_loan_no_synth config span bid !joined_ctx;
-                  ctx
-              | LoansInLeft bids ->
-                  joined_ctx :=
-                    InterpBorrows.end_loans_no_synth config span bids
-                      !joined_ctx;
-                  ctx
-              | AbsInRight _ | AbsInLeft _ -> [%craise] span "Unexpected"
-            in
-            join_one_aux ctx
+      let joined_ctx =
+        ref
+          (loop_join_break_ctxs_prepare config span loop_id fixed_aids fixed_dids
+             ctx)
       in
-      let join_one (ctx : eval_ctx) =
-        (* Join the two contexts  *)
-        let ctx1 = join_one_aux ctx in
-        [%ltrace
-          "join_one: after join:\n" ^ eval_ctx_to_string ~span:(Some span) ctx1];
-
-        (* Collapse to eliminate the markers *)
-        joined_ctx :=
-          collapse_ctx config span fresh_abs_kind ~recoverable:false
-            ~with_abs_conts !joined_ctx;
-        [%ltrace
-          "join_one: after join-collapse:\n"
-          ^ eval_ctx_to_string ~span:(Some span) !joined_ctx];
-        (* Sanity check *)
-        if !Config.sanity_checks then
-          Invariants.check_invariants span !joined_ctx;
-
-        (* Reduce (it helps matching afterwards) *)
-        joined_ctx :=
-          reduce_ctx config span ~with_abs_conts fresh_abs_kind fixed_aids
-            fixed_dids !joined_ctx;
-        [%ltrace
-          "join_one: after last reduce:\n"
-          ^ eval_ctx_to_string ~span:(Some span) !joined_ctx];
-
-        (* Sanity check *)
-        if !Config.sanity_checks then
-          Invariants.check_invariants span !joined_ctx
-      in
-      List.iter join_one ctxl;
-
-      (* Update the fresh region abstractions *)
+      loop_join_break_ctxs_join config span loop_id fixed_aids fixed_dids
+        joined_ctx ctxl;
       !joined_ctx
+
+(** Join further contexts at a break into an already joined context.
+
+    The caller gets the contexts at the breaks in batches -- it evaluates the loop body
+    twice, the second time so that the break paths carry fresh ids -- and a context at a
+    break is a whole environment. Joining each batch as it is produced means the two
+    batches are never both in memory, which is the difference between one and two copies of
+    every path's environment. *)
+let loop_join_break_ctxs_more (config : config) (span : Meta.span)
+    (loop_id : LoopId.id) (fixed_aids : AbsId.Set.t)
+    (fixed_dids : DummyVarId.Set.t) (joined : eval_ctx) (ctxl : eval_ctx list) :
+    eval_ctx =
+  let joined_ctx = ref joined in
+  loop_join_break_ctxs_join config span loop_id fixed_aids fixed_dids joined_ctx
+    ctxl;
+  !joined_ctx
 
 (** TODO: this is a bit of a hack: remove once the avalues are properly
     destructured. *)

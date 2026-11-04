@@ -754,7 +754,7 @@ and eval_statement_list (config : config) span (stmts : statement list) :
            expression from the continuations for the individual branches
       *)
       let ctx_resl, cf_st2 = comp_seqs __FILE__ __LINE__ span ctx_res_cfl in
-      (ctx_resl, cc_comp cf_st1 cf_st2)
+      (ctx_resl, compose_trace span cf_st1 cf_st2)
 
 and eval_block (config : config) (b : block) : stl_cm_fun =
  fun ctx ->

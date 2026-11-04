@@ -33,7 +33,7 @@ let eval_loop_concrete (span : Meta.span) (eval_loop_body : stl_cm_fun) :
         [ (ctx, res) ]
     | Continue 0 ->
         (* Re-evaluate the loop body *)
-        let ctx_resl, _ = eval_loop_body ctx in
+        let ctx_resl, _ = Cps.without_trace (fun () -> eval_loop_body ctx) in
         let ctx_res_cfl =
           List.map (fun (ctx, res) -> rec_eval_loop_body ctx res) ctx_resl
         in

@@ -118,10 +118,7 @@ let compute_loop_entry_fixed_point (config : config) (span : Meta.span)
     [%ltrace "join_ctxs"];
     (* Join the context with the context at the loop entry *)
     update_fixed_ids ctxs;
-    let (_, _), ctx2 =
-      loop_join_origin_with_continue_ctxs config span loop_id ctx1 ctxs
-    in
-    ctx2
+    loop_join_origin_with_continue_ctxs config span loop_id ctx1 ctxs
   in
 
   (* Check if two contexts are equivalent - modulo alpha conversion on the
@@ -163,7 +160,8 @@ let compute_loop_entry_fixed_point (config : config) (span : Meta.span)
     else
       (* Evaluate the loop body to register the different contexts upon reentry *)
       Diagnose.set_phase ~clear_item:false ("loop-iter-" ^ string_of_int i);
-      let ctx_resl, _ = eval_loop_body ctx in
+      (* The trace is discarded: this is a search for a context, not for a program. *)
+      let ctx_resl, _ = Cps.without_trace (fun () -> eval_loop_body ctx) in
       (* Keep only the contexts which reached a `continue`. *)
       let keep_continue_ctx (ctx, res) =
         [%ltrace "register_continue_ctx"];
@@ -281,7 +279,7 @@ let compute_loop_break_context (config : config) (span : Meta.span)
      then introduces all the necessary abstractions. *)
   let eval_break_ctxs () =
     (* Evaluate the loop body to register the different contexts at a break. *)
-    let ctx_resl, _ = eval_loop_body fp_ctx in
+    let ctx_resl, _ = Cps.without_trace (fun () -> eval_loop_body fp_ctx) in
     let keep_break_ctx (ctx, res) : eval_ctx option =
       [%ltrace "register_break_ctx"];
       match res with
@@ -317,12 +315,15 @@ let compute_loop_break_context (config : config) (span : Meta.span)
       (* Single break context *)
       Single
   | ctxs ->
-      (* Evaluate a second time so that the same break paths contain fresh IDs,
-         then join all the contexts as before. *)
-      let ctxs = ctxs @ eval_break_ctxs () in
-      (* Join the contexts *)
+      (* Join the first batch, then evaluate the body a second time so that the same break
+         paths carry fresh ids, and join that batch as it arrives. Joining the two batches
+         together would hold both in memory, and each is a whole environment per path. *)
       let break_ctx =
         loop_join_break_ctxs config span loop_id fixed_aids fixed_dids ctxs
+      in
+      let break_ctx =
+        loop_join_break_ctxs_more config span loop_id fixed_aids fixed_dids break_ctx
+          (eval_break_ctxs ())
       in
       (* Debug *)
       [%ltrace
