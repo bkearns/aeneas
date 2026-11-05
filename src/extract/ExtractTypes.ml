@@ -812,6 +812,20 @@ and extract_trait_instance_id (span : Meta.span) (ctx : extraction_ctx)
         | BuiltinFn -> ("BuiltinFn", builtin_fn_update_generics generics)
         | BuiltinFnMut -> ("BuiltinFnMut", builtin_fn_update_generics generics)
         | BuiltinFnOnce -> ("BuiltinFnOnce", builtin_fn_update_generics generics)
+        | BuiltinFuture ->
+            (* The [Future] implementation of a value that a synchronous entry
+               point awaits through a runtime handle. Nothing of the computation
+               behind it is described -- it is assumed, not translated -- and the
+               instance is only ever consumed by a signature-only function, so it
+               is extracted as an uninterpreted value. This is the assumption
+               [PrePasses.model_awaited_computations] records, made visible where
+               the value crosses the boundary. The generic arguments are dropped
+               with it: they belong to a [Future] instance that has no model. *)
+            [%lwarning
+              "Extracted the [Future] implementation of an awaited computation \
+               as an uninterpreted value: the computation is assumed, not \
+               described"];
+            (ExtractErrors.admit (), { types = []; const_generics = []; trait_refs = [] })
       in
       if inside then F.pp_print_string fmt "(";
       F.pp_print_string fmt name;

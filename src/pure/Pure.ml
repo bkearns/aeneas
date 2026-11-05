@@ -676,6 +676,14 @@ and builtin_impl_data =
   | BuiltinFn
   | BuiltinFnMut
   | BuiltinFnOnce
+  | BuiltinFuture
+      (** The compiler-supplied [Future] implementation of the value an
+          [async fn] returns, which appears in a call that awaits that value
+          through a runtime handle. The implementation has no content we could
+          translate -- the computation behind it is assumed, not described -- so
+          it is extracted as an uninterpreted value. See
+          [PrePasses.model_awaited_computations] for the assumption it
+          represents. *)
 
 and trait_instance_id =
   | Self

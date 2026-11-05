@@ -133,6 +133,166 @@ let remove_unreachable (crate : crate) (f : fun_decl) : fun_decl =
       { f with body = StructuredBody body }
   | _ -> f
 
+(** Model a synchronous entry point that awaits an asynchronous computation
+    through a runtime handle.
+
+    An [async fn]'s value has no translation in LLBC: Charon gives the
+    function's output type the placeholder
+    [TError "Coroutine types are not supported yet"] and replaces its body with
+    an error, because the body is a coroutine. A caller that hands that value to
+    the runtime -- [handle.block_on(c)] -- then mentions the placeholder in the
+    argument of an ordinary call, and every type-level use of a [TError] is
+    rejected ("Found type error in the output of charon"), so the caller's body
+    is dropped. A synchronous function whose only sin is awaiting an
+    asynchronous one through a handle is therefore unextractable, which is what
+    this pass fixes.
+
+    We model the boundary rather than translate it, and record it as an
+    assumption instead of an identity:
+
+    - the value an [async fn] returns is an {e opaque} type ([Future] below): a
+      token standing for a computation, with no observable structure;
+    - the [async fn] keeps its signature and loses its body: it becomes a
+      signature-only (i.e. assumed) function that produces such a token;
+    - the runtime call is the synchronous boundary, and its contract is:
+
+    {v
+block_on(f) evaluates f to completion and returns its output;
+         no other effect is observable.
+    v}
+
+    ASSUMPTION (for the assumption ledger): a value produced by an [async fn]
+    and awaited through a runtime handle is opaque; [block_on(f)] evaluates [f]
+    to completion and returns its output; no other effect is observable; the
+    computation's internals are not observable at all.
+
+    This is deliberately not silent: the computation is not inlined, its body is
+    assumed rather than verified, and the token carrying it from the [async fn]
+    to the boundary is an uninterpreted type. A crate containing no such call is
+    returned unchanged, byte for byte, so this pass cannot move the translation
+    of anything that already translates. *)
+let model_awaited_computations (crate : crate) : crate =
+  (* Charon's name for the placeholder, not ours. It is the whole marker: we do
+     not guess at any other error type, so an unrelated translation failure
+     stays an error. *)
+  let marker = "Coroutine types are not supported yet" in
+  (* A fresh identifier: nothing else in the pipeline allocates type
+     declarations after Charon, so the highest existing id plus one is free. *)
+  let id =
+    let highest =
+      TypeDeclId.Map.fold
+        (fun id _ acc -> TypeDeclId.max id acc)
+        crate.type_decls TypeDeclId.zero
+    in
+    TypeDeclId.incr highest
+  in
+  let tref : type_decl_ref =
+    { Types.id; generics = TypesUtils.empty_generic_args; builtin = None }
+  in
+  let used = ref false in
+  (* The declaration cites the source line of the first function whose output
+     type we repaired, so the generated code points at the Rust it assumed. *)
+  let span = ref None in
+  let visitor =
+    object
+      inherit [_] map_crate as super
+
+      method! visit_TError env (msg : string) : ty =
+        if msg = marker then begin
+          used := true;
+          TAdt tref
+        end
+        else TError (super#visit_string env msg)
+
+      method! visit_fun_decl env (f : fun_decl) : fun_decl =
+        let before = !used in
+        let f = super#visit_fun_decl env f in
+        (* Remember where the repaired type first came from, so the generated
+           declaration cites the Rust it assumed. *)
+        if (not before) && !used && !span = None then
+          span := Some f.item_meta.span;
+        f
+    end
+  in
+  let crate = visitor#visit_crate () crate in
+  if not !used then crate
+  else begin
+    (* A name that cannot collide with a Rust item of this crate: [Future] is
+       what Rust calls this value, and a disambiguator is bumped if the crate
+       already has a top-level item of that name. *)
+    let name_of (d : type_decl) = d.item_meta.name in
+    let taken (d0 : Disambiguator.id) =
+      TypeDeclId.Map.exists
+        (fun _ d -> name_of d = [ PeIdent ("Future", d0) ])
+        crate.type_decls
+    in
+    let rec pick (i : int) : Disambiguator.id =
+      let d = Disambiguator.of_int i in
+      if taken d then pick (i + 1) else d
+    in
+    let item_meta =
+      {
+        name = [ PeIdent ("Future", pick 0) ];
+        span =
+          (match !span with
+          | Some span -> span
+          | None -> (
+              (* The placeholder appeared outside any function body. *)
+              match FunDeclId.Map.bindings crate.fun_decls with
+              | (_, f) :: _ -> f.item_meta.span
+              | [] -> (
+                  match TypeDeclId.Map.bindings crate.type_decls with
+                  | (_, d) :: _ -> d.item_meta.span
+                  | [] -> assert false)));
+        source_text = None;
+        attr_info =
+          { attributes = []; inline = None; rename = None; public = true };
+        is_local = true;
+        started_from = true;
+        is_extern = false;
+        (* Opaque: nothing of the computation is translated, and the type is
+           emitted as an uninterpreted one. *)
+        opacity = ItemOpaque;
+        lang_item = None;
+        diagnostic_item = None;
+        has_errors = false;
+      }
+    in
+    let decl =
+      {
+        def_id = id;
+        item_meta;
+        generics = TypesUtils.empty_generic_params;
+        src = NormalType;
+        kind = Opaque;
+        layout = [];
+        ptr_metadata = NoMetadata;
+        marker_traits = None;
+      }
+    in
+    let type_decls = TypeDeclId.Map.add id decl crate.type_decls in
+    (* The [async fn] keeps its signature and loses its body: it is assumed to
+       produce the token, and its signature is what the caller needs. Only a
+       function whose output type we just repaired is treated this way. *)
+    let fun_decls =
+      FunDeclId.Map.map
+        (fun (f : fun_decl) ->
+          match (f.body, f.signature.output) with
+          | ErrorBody _, TAdt r when r.id = id -> { f with body = OpaqueBody }
+          | _ -> f)
+        crate.fun_decls
+    in
+    let declarations =
+      Some
+        (TypeGroup (NonRecGroup id)
+        ::
+        (match crate.declarations with
+        | Some gs -> gs
+        | None -> []))
+    in
+    { crate with type_decls; fun_decls; declarations }
+  end
+
 (** The Rust compiler generates a unique implementation of [Default] for arrays
     for every choice of length. For instance, if we write:
     {[
@@ -2674,6 +2834,7 @@ let fix_anon_const_initializers (crate : crate) (f : fun_decl) : fun_decl =
 
 let apply_passes (crate : crate) : crate =
   (* Passes that apply to the whole crate *)
+  let crate = model_awaited_computations crate in
   let crate = update_array_default crate in
   let crate = anon_consts_to_calls crate in
   (* Passes that apply to individual function bodies *)

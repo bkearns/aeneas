@@ -112,6 +112,7 @@ and translate_trait_ref_kind (span : Meta.span option)
         | BuiltinFn -> BuiltinFn
         | BuiltinFnMut -> BuiltinFnMut
         | BuiltinFnOnce -> BuiltinFnOnce
+        | BuiltinFuture -> BuiltinFuture
         | _ ->
             [%craise_opt_span] span
               ("Unhandled `BuiltinOrAuto` for trait "
