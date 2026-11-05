@@ -1,5 +1,6 @@
 module
 public import Aeneas.Std.Core.Cmp
+public import Aeneas.Std.Core.Ops
 public import Aeneas.Std.Primitives
 public import Aeneas.Std.Range
 public import Aeneas.Std.Scalar.Core
@@ -55,6 +56,29 @@ structure core.iter.adapters.take.Take (I : Type u) where
 @[rust_type "core::iter::adapters::rev::Rev"]
 structure core.iter.adapters.rev.Rev (T : Type u) where
   iter : T
+
+/-- `core::iter::adapters::chain::Chain` — the `a.chain(b)` adapter.
+
+    Rust's struct is `{ a: Option<A>, b: Option<B> }`: `next` drains `a`, and the first time `a`
+    yields `none` it is dropped (`a := none`) and `b` is drained instead. Keeping the same shape
+    means the model's state is exactly the state the Rust loop keeps, including the fact that a
+    drained `a` is never resumed. -/
+@[rust_type "core::iter::adapters::chain::Chain"]
+structure core.iter.adapters.chain.Chain (A : Type u) (B : Type v) where
+  a : Option A
+  b : Option B
+
+/-- `core::iter::adapters::filter::Filter` — the `a.filter(p)` adapter. -/
+@[rust_type "core::iter::adapters::filter::Filter"]
+structure core.iter.adapters.filter.Filter (I : Type u) (P : Type v) where
+  iter : I
+  predicate : P
+
+/-- `core::iter::adapters::map::Map` — the `a.map(f)` adapter. -/
+@[rust_type "core::iter::adapters::map::Map"]
+structure core.iter.adapters.map.Map (I : Type u) (F : Type v) where
+  iter : I
+  f : F
 
 /-- `core::iter::adapters::zip::Zip` — the `a.zip(b)` adapter.
 
@@ -132,8 +156,110 @@ theorem core.iter.traits.iterator.Iterator.count.loop_succ
         let c ← core.iter.traits.iterator.Iterator.count.loop next fuel self
         c + 1#usize) := rfl
 
+/-- `Iterator::find`'s loop: advance `next` until the closure accepts an element, threading the
+closure's own state. Like Rust's loop it does not terminate on an iterator that never yields an
+accepted element, so it is a fixpoint rather than a structural recursion. -/
+def core.iter.traits.iterator.Iterator.find.loop
+  {Self Item P : Type _}
+  (next : Self → Result (Option Item × Self))
+  (predicate : P → Item → Result (Bool × P)) :
+  P → Self → Result ((Option Item) × Self)
+  | p, self => do
+    let (opt, self) ← next self
+    match opt with
+    | none => .ok (none, self)
+    | some item => do
+      let (accept, p) ← predicate p item
+      if accept then .ok (some item, self)
+      else core.iter.traits.iterator.Iterator.find.loop next predicate p self
+partial_fixpoint
+
+/-! ## The `Iterator` / `IntoIterator` cycle, and what breaks it
+
+`Iterator::chain` and `Iterator::collect` take an `IntoIterator` (resp. a `FromIterator`) value,
+and `IntoIterator` used to carry the full `Iterator` dictionary of the iterator it converts into.
+That is a cycle: the `Iterator` structure would have to be declared before a type that mentions it.
+Rust has the same cycle and does not feel it, because traits there are bounds rather than values.
+
+What breaks it is that `IntoIterator`'s only *use* of the dictionary is `next`
+(`FromIterator::from_iter` walks its argument), so it carries the one method it needs instead of
+the whole dictionary. `Iterator` then embeds into `SimpleIterator` through a coercion, which means
+a full dictionary can still be written where a `SimpleIterator` is expected -- including the
+literals the translator emits for a crate's own `impl IntoIterator` blocks -- while a dictionary's
+`collect` field can be built from its own `next` without naming the record being defined. -/
+
+/-- The part of an `Iterator` dictionary that `IntoIterator` and `FromIterator` actually walk.
+
+    A full `Iterator` coerces into this (see the instance after `Iterator`), so this is an
+    implementation detail of the model, not something emitted code has to construct. -/
+structure core.iter.traits.iterator.SimpleIterator (Self : Type _) (Item : Type _) where
+  next : Self → Result ((Option Item) × Self)
+
+@[rust_trait "core::iter::traits::collect::IntoIterator"
+  (parentClauses := ["iteratorInst"])]
+structure core.iter.traits.collect.IntoIterator (Self : Type _) (Item :
+  Type _) (IntoIter : Type _) where
+  iteratorInst : core.iter.traits.iterator.SimpleIterator IntoIter Item
+  into_iter : Self → Result IntoIter
+
+@[rust_trait "core::iter::traits::collect::FromIterator"]
+structure core.iter.traits.collect.FromIterator (Self : Type w) (A : Type v) where
+  /- `{T : Type u}` and `{IntoIter : Type x}` are structure universe parameters, not universe-0
+     binders: `from_iter` has to be applicable to a `Self` that lives above `Type`, which is what
+     a dictionary's `collect` field does when it hands it its own `next`. -/
+  from_iter : forall {T : Type u} {IntoIter : Type x}
+    (_ : core.iter.traits.collect.IntoIterator T A IntoIter),
+    T → Result Self
+
+/-- The blanketed `IntoIterator` of an iterator that is its own `IntoIter` (`IntoIterator.Blanket`),
+built from `next` alone. This is what a dictionary's `collect` field hands to `from_iter`. -/
+@[reducible]
+def core.iter.traits.collect.intoIteratorOfNext {Self Item : Type _}
+  (next : Self → Result ((Option Item) × Self)) :
+  core.iter.traits.collect.IntoIterator Self Item Self :=
+  { iteratorInst := ⟨next⟩, into_iter := fun x => .ok x }
+
+/-! ### The bodies of `chain`, `map`, `filter` and `find`, without the dictionary
+
+These are the models the `Iterator` dictionary fields default to, and the models the
+`@[trait_default]` wrapper functions below delegate to. They are declared *before* the structure so
+that its field defaults can name them, and they take everything they need as an argument instead of
+the dictionary: see the note on `impl_def` unfolding below. -/
+
+/-- `Iterator::chain` body: `Chain::new(self, other.into_iter())`. -/
+def core.iter.traits.iterator.Iterator.chainBody
+  {Self : Type _} {U : Type _} {Item : Type _} {IntoIter : Type _}
+  (intoIteratorInst : core.iter.traits.collect.IntoIterator U Item IntoIter) :
+  Self → U → Result (core.iter.adapters.chain.Chain Self IntoIter) :=
+  fun self other => do
+    let b ← intoIteratorInst.into_iter other
+    .ok ⟨some self, some b⟩
+
+/-- `Iterator::map` body: `Map { iter: self, f }`. -/
+def core.iter.traits.iterator.Iterator.mapBody
+  {Self : Type _} {B : Type _} {F : Type _} {Item : Type _}
+  (_FnMutInst : core.ops.function.FnMut F Item B) :
+  Self → F → Result (core.iter.adapters.map.Map Self F) :=
+  fun self f => .ok ⟨self, f⟩
+
+/-- `Iterator::filter` body: `Filter { iter: self, predicate }`. -/
+def core.iter.traits.iterator.Iterator.filterBody
+  {Self : Type _} {P : Type _} {Item : Type _}
+  (_FnMutInst : core.ops.function.FnMut P Item Bool) :
+  Self → P → Result (core.iter.adapters.filter.Filter Self P) :=
+  fun self p => .ok ⟨self, p⟩
+
+/-- `Iterator::find` body: the trait's loop over `next`. -/
+def core.iter.traits.iterator.Iterator.findBody
+  {Self : Type _} {P : Type _} {Item : Type _}
+  (next : Self → Result ((Option Item) × Self))
+  (FnMutInst : core.ops.function.FnMut P Item Bool) :
+  Self → P → Result ((Option Item) × Self) :=
+  fun self p =>
+    core.iter.traits.iterator.Iterator.find.loop next FnMutInst.call_mut p self
+
 @[rust_trait "core::iter::traits::iterator::Iterator"]
-structure core.iter.traits.iterator.Iterator (Self : Type _) (Self_Item : Type _)
+structure core.iter.traits.iterator.Iterator (Self : Type u) (Self_Item : Type v)
   where
   next : Self → Result ((Option Self_Item) × Self)
   /- `count` is a provided method, so the dictionary carries it rather than an implementation.
@@ -145,13 +271,56 @@ structure core.iter.traits.iterator.Iterator (Self : Type _) (Self_Item : Type _
   step_by : Self → Usize → Result (core.iter.adapters.step_by.StepBy Self) := core.iter.traits.iterator.Iterator.step_by.default
   enumerate : Self → Result (core.iter.adapters.enumerate.Enumerate Self) := core.iter.traits.iterator.Iterator.enumerate.default
   take : Self → Usize → Result (core.iter.adapters.take.Take Self) := core.iter.traits.iterator.Iterator.take.default
-  -- TODO: adding more fields like rev leads to a circularity.
-  -- As an approximation we could only require these methods to implement a smaller version of
-  -- `Iterator` with, e.g., only the `next` method. Most implementations should satisfy this
-  -- model. In order to make the extraction work, we would also define a coercion from
-  -- `Iterator` to `SimpleIterator`.
-  -- rev : Self → Result (core.iter.adapters.rev.Rev Self) -- this leads to a circularity
-  -- TODO: collect
+  /- The adapters below are provided methods too, and the translator emits a field for each one
+     it translated in the crate being extracted -- not only for the ones that crate *calls*
+     through a dictionary, but in every `impl Iterator` literal it emits. A field the model
+     lacks is therefore a hard error in unrelated code (`... is not a field of structure
+     Iterator`), which is why all of them are modelled here rather than "the ones we need".
+
+     Each field's type is the emitted value's type: the dictionary is already applied, so what
+     is left is the method's own generics (implicit), its own non-`self` arguments, then
+     `Self`. The structure's two universes are named rather than `_` because these binders have
+     to be related to `Self_Item`'s, which an inference metavariable per field cannot express. -/
+  chain : {U : Type} → {IntoIter : Type} →
+    core.iter.traits.collect.IntoIterator U Self_Item IntoIter →
+    Self → U → Result (core.iter.adapters.chain.Chain Self IntoIter) :=
+    core.iter.traits.iterator.Iterator.chainBody
+  map : {B : Type} → {F : Type} → core.ops.function.FnMut F Self_Item B →
+    Self → F → Result (core.iter.adapters.map.Map Self F) :=
+    core.iter.traits.iterator.Iterator.mapBody
+  filter : {P : Type} → core.ops.function.FnMut P Self_Item Bool →
+    Self → P → Result (core.iter.adapters.filter.Filter Self P) :=
+    core.iter.traits.iterator.Iterator.filterBody
+  /- `find` is the trait's own loop over `next`, so the default needs nothing but the `next`
+     field above; the closure's state is threaded through it exactly as the emitted body does. -/
+  find : {P : Type} → core.ops.function.FnMut P Self_Item Bool →
+    Self → P → Result ((Option Self_Item) × Self) :=
+    fun {P} predicateInst =>
+      core.iter.traits.iterator.Iterator.findBody next predicateInst
+  /- `collect` is `from_iter(self)`: the `FromIterator` implementation walks `next`, and the
+     dictionary it is handed is built from this dictionary's `next` alone (see
+     `SimpleIterator`), so the default does not have to name the record it is defining. -/
+  collect : {B : Type} → core.iter.traits.collect.FromIterator B Self_Item →
+    Self → Result B :=
+    fun {B} fromIteratorInst self =>
+      fromIteratorInst.from_iter (T := Self) (IntoIter := Self)
+        (core.iter.traits.collect.intoIteratorOfNext next) self
+
+
+/-- A dictionary is a `SimpleIterator`: the coercion lets a full `Iterator` be written wherever
+the `next`-only view is expected (`IntoIterator` literals, `FromIterator` implementations), so the
+split is invisible to emitted code. -/
+@[reducible]
+def core.iter.traits.iterator.Iterator.toSimpleIterator {Self Item : Type _}
+  (IteratorInst : core.iter.traits.iterator.Iterator Self Item) :
+  core.iter.traits.iterator.SimpleIterator Self Item :=
+  ⟨IteratorInst.next⟩
+
+@[reducible]
+instance core.iter.traits.iterator.Iterator.instCoeSimpleIterator {Self Item : Type _} :
+  Coe (core.iter.traits.iterator.Iterator Self Item)
+    (core.iter.traits.iterator.SimpleIterator Self Item) :=
+  ⟨core.iter.traits.iterator.Iterator.toSimpleIterator⟩
 
 /-- The trait's default body for `count`, over an explicit dictionary. The `Iterator::count` entry
 of the model table names `count.trait_default`, because that is the shape the translator emits for
@@ -242,19 +411,6 @@ structure core.iter.traits.accum.Sum (Self : Type _) (A : Type _) where
 structure core.iter.traits.accum.Product (Self : Type _) (A : Type _) where
   product : forall {I : Type} (_ : core.iter.traits.iterator.Iterator I A), I → Result Self
 
-@[rust_trait "core::iter::traits::collect::IntoIterator"
-  (parentClauses := ["iteratorInst"])]
-structure core.iter.traits.collect.IntoIterator (Self : Type _) (Item :
-  Type _) (IntoIter : Type _) where
-  iteratorInst : core.iter.traits.iterator.Iterator IntoIter Item
-  into_iter : Self → Result IntoIter
-
-@[rust_trait "core::iter::traits::collect::FromIterator"]
-structure core.iter.traits.collect.FromIterator (Self : Type _) (A : Type _) where
-  from_iter : forall {T : Type} {IntoIter : Type}
-    (_ : core.iter.traits.collect.IntoIterator T A IntoIter),
-    T → Result Self
-
 @[rust_fun
   "core::iter::traits::collect::{core::iter::traits::collect::IntoIterator<@I, @Item, @I>}::into_iter",
   simp]
@@ -272,14 +428,68 @@ def core.iter.traits.collect.IntoIterator.Blanket {I : Type _} {Item : Type _}
   into_iter := core.iter.traits.collect.IntoIterator.Blanket.into_iter IteratorInst
 }
 
-@[rust_fun "core::iter::traits::iterator::Iterator::collect"]
+@[trait_default, rust_fun "core::iter::traits::iterator::Iterator::collect"]
 def core.iter.traits.iterator.Iterator.collect.default
-  {Self : Type} {B : Type _} {Item : Type _} (IteratorInst :
+  {Self : Type _} {B : Type _} {Item : Type _} (IteratorInst :
   core.iter.traits.iterator.Iterator Self Item)
   (collectFromIteratorInst : core.iter.traits.collect.FromIterator B Item) :
   Self → Result B :=
   fun self => collectFromIteratorInst.from_iter
-    (core.iter.traits.collect.IntoIterator.Blanket IteratorInst) self
+    (core.iter.traits.collect.intoIteratorOfNext IteratorInst.next) self
+
+/-! ### The `@[trait_default]` entries for `chain`, `map`, `filter` and `find`
+
+These are the names the model table gives the translator for the trait's provided methods, so a
+`chain :=` (etc.) field of an emitted `impl Iterator` literal is set to
+`trait_default <the dictionary being defined> <the method's own arguments>`, and a call on a
+concrete iterator resolves to the same name. Their signatures are therefore fixed by what the
+translator prints:
+
+* `chain` takes the `IntoIterator` instance and returns `Self → U → Result (Chain _ _)`;
+* `map` / `filter` take the `FnMut` instance and return `Self → F → Result (Map _ _)` (resp. the
+  predicate and `Filter`);
+* `find` takes the `FnMut` instance and returns `Self → P → Result (Option Item × Self)`.
+
+Each one's body is the `*Body` function above, which does not take the dictionary at all. That
+split is not cosmetic: `impl_def` accepts a self-reference in an emitted literal only if it can
+eliminate it, which it does by unfolding a `@[trait_default]` definition and replacing *projections*
+of the dictionary with the fields already resolved. A body that still *applies* the dictionary (to
+a helper that is not itself a `trait_default`) survives the unfold, and `impl_def` then rejects the
+whole literal with `could not resolve recursive fields`. So each wrapper below reaches its model in
+one unfold step, and the only dictionary use left in the result is the projection `Iterator.next`
+in `findBody` (and in `collect.default` above), which `impl_def` substitutes. -/
+
+@[trait_default, rust_fun "core::iter::traits::iterator::Iterator::chain"]
+def core.iter.traits.iterator.Iterator.chain.trait_default
+  {Self : Type _} {U : Type _} {Item : Type _} {IntoIter : Type _}
+  (_IteratorInst : core.iter.traits.iterator.Iterator Self Item)
+  (intoIteratorInst : core.iter.traits.collect.IntoIterator U Item IntoIter) :
+  Self → U → Result (core.iter.adapters.chain.Chain Self IntoIter) :=
+  core.iter.traits.iterator.Iterator.chainBody intoIteratorInst
+
+@[trait_default, rust_fun "core::iter::traits::iterator::Iterator::map"]
+def core.iter.traits.iterator.Iterator.map.trait_default
+  {Self : Type _} {B : Type _} {F : Type _} {Item : Type _}
+  (_IteratorInst : core.iter.traits.iterator.Iterator Self Item)
+  (FnMutInst : core.ops.function.FnMut F Item B) :
+  Self → F → Result (core.iter.adapters.map.Map Self F) :=
+  core.iter.traits.iterator.Iterator.mapBody FnMutInst
+
+@[trait_default, rust_fun "core::iter::traits::iterator::Iterator::filter"]
+def core.iter.traits.iterator.Iterator.filter.trait_default
+  {Self : Type _} {P : Type _} {Item : Type _}
+  (_IteratorInst : core.iter.traits.iterator.Iterator Self Item)
+  (FnMutInst : core.ops.function.FnMut P Item Bool) :
+  Self → P → Result (core.iter.adapters.filter.Filter Self P) :=
+  core.iter.traits.iterator.Iterator.filterBody FnMutInst
+
+@[trait_default, rust_fun "core::iter::traits::iterator::Iterator::find"]
+def core.iter.traits.iterator.Iterator.find.trait_default
+  {Self : Type _} {P : Type _} {Item : Type _}
+  (IteratorInst : core.iter.traits.iterator.Iterator Self Item)
+  (FnMutInst : core.ops.function.FnMut P Item Bool) :
+  Self → P → Result ((Option Item) × Self) :=
+  core.iter.traits.iterator.Iterator.findBody IteratorInst.next FnMutInst
 
 @[rust_trait "core::iter::traits::collect::Extend"]
 structure core.iter.traits.collect.Extend (Self : Type _) (A : Type _) where
@@ -664,6 +874,109 @@ impl_def core.iter.traits.iterator.IteratorTake {I : Type _} {Item : Type _}
     (core.iter.traits.iterator.IteratorTake IteratorInst)
 }
 
+-- ============================================================================
+-- Chain / Map / Filter: `next` for the iterators the adapters produce
+-- ============================================================================
+
+/-- The `b` half of `Chain::next`, shared by the two states in which `a` is already drained. -/
+def core.iter.adapters.chain.Chain.nextB
+  {A B Item : Type _} (IB : core.iter.traits.iterator.Iterator B Item) :
+  Option B → Result ((Option Item) × (core.iter.adapters.chain.Chain A B))
+  | none => .ok (none, ⟨none, none⟩)
+  | some b => do
+    let (opt, b) ← IB.next b
+    .ok (opt, ⟨none, some b⟩)
+
+/-- `Chain<A, B>::next`: drain `a`; once `a` yields `none`, drop it (`a := none`) and drain `b`.
+
+    Rust's `next` takes `a` out of the option, and only puts it back when it produced an item, so a
+    drained `a` is never resumed -- which is why this needs no loop: at most one call to `IA.next`
+    and one to `IB.next` per call, exactly like the Rust code. -/
+@[rust_fun
+  "core::iter::adapters::chain::{core::iter::traits::iterator::Iterator<core::iter::adapters::chain::Chain<@A, @B>, @Clause0_Item>}::next"]
+def core.iter.adapters.chain.Chain.Insts.CoreIterTraitsIteratorIterator.next
+  {A B Item : Type _}
+  (IA : core.iter.traits.iterator.Iterator A Item)
+  (IB : core.iter.traits.iterator.Iterator B Item) :
+  core.iter.adapters.chain.Chain A B →
+  Result ((Option Item) × (core.iter.adapters.chain.Chain A B))
+  | ⟨some a, b⟩ => do
+    let (opt, a) ← IA.next a
+    match opt with
+    | some item => .ok (some item, ⟨some a, b⟩)
+    | none => core.iter.adapters.chain.Chain.nextB IB b
+  | ⟨none, b⟩ => core.iter.adapters.chain.Chain.nextB IB b
+
+@[reducible, rust_trait_impl
+  "core::iter::traits::iterator::Iterator<core::iter::adapters::chain::Chain<@A, @B>, @Clause0_Item>"]
+impl_def core.iter.adapters.chain.Chain.Insts.CoreIterTraitsIteratorIterator
+  {A B Item : Type _}
+  (IA : core.iter.traits.iterator.Iterator A Item)
+  (IB : core.iter.traits.iterator.Iterator B Item) :
+  core.iter.traits.iterator.Iterator (core.iter.adapters.chain.Chain A B) Item := {
+  next := core.iter.adapters.chain.Chain.Insts.CoreIterTraitsIteratorIterator.next IA IB
+}
+
+/-- `Map<I, F>::next`: advance the inner iterator and apply the closure to what it yields. -/
+@[rust_fun
+  "core::iter::adapters::map::{core::iter::traits::iterator::Iterator<core::iter::adapters::map::Map<@I, @F>, @B>}::next"]
+def core.iter.adapters.map.Map.Insts.CoreIterTraitsIteratorIterator.next
+  {B I F Item : Type _}
+  (IA : core.iter.traits.iterator.Iterator I Item)
+  (FInst : core.ops.function.FnMut F Item B) :
+  core.iter.adapters.map.Map I F →
+  Result ((Option B) × (core.iter.adapters.map.Map I F))
+  | ⟨iter, f⟩ => do
+    let (opt, iter) ← IA.next iter
+    match opt with
+    | none => .ok (none, ⟨iter, f⟩)
+    | some item => do
+      let (b, f) ← FInst.call_mut f item
+      .ok (some b, ⟨iter, f⟩)
+
+@[reducible, rust_trait_impl
+  "core::iter::traits::iterator::Iterator<core::iter::adapters::map::Map<@I, @F>, @B>"]
+impl_def core.iter.adapters.map.Map.Insts.CoreIterTraitsIteratorIterator
+  {B I F Item : Type _}
+  (IA : core.iter.traits.iterator.Iterator I Item)
+  (FInst : core.ops.function.FnMut F Item B) :
+  core.iter.traits.iterator.Iterator (core.iter.adapters.map.Map I F) B := {
+  next := core.iter.adapters.map.Map.Insts.CoreIterTraitsIteratorIterator.next IA FInst
+}
+
+/-- `Filter<I, P>::next`: advance the inner iterator until the predicate accepts an element, or
+the inner iterator is exhausted. Like Rust's loop this does not terminate on an iterator whose
+predicate never accepts, so it is a fixpoint. -/
+@[rust_fun
+  "core::iter::adapters::filter::{core::iter::traits::iterator::Iterator<core::iter::adapters::filter::Filter<@I, @P>, @Clause0_Item>}::next"]
+def core.iter.adapters.filter.Filter.Insts.CoreIterTraitsIteratorIterator.next
+  {I P Item : Type _}
+  (IA : core.iter.traits.iterator.Iterator I Item)
+  (PInst : core.ops.function.FnMut P Item Bool) :
+  core.iter.adapters.filter.Filter I P →
+  Result ((Option Item) × (core.iter.adapters.filter.Filter I P))
+  | ⟨iter, p⟩ => do
+    let (opt, iter) ← IA.next iter
+    match opt with
+    | none => .ok (none, ⟨iter, p⟩)
+    | some item => do
+      let (accept, p) ← PInst.call_mut p item
+      if accept then .ok (some item, ⟨iter, p⟩)
+      else
+        core.iter.adapters.filter.Filter.Insts.CoreIterTraitsIteratorIterator.next
+          IA PInst ⟨iter, p⟩
+partial_fixpoint
+
+@[reducible, rust_trait_impl
+  "core::iter::traits::iterator::Iterator<core::iter::adapters::filter::Filter<@I, @P>, @Clause0_Item>"]
+impl_def core.iter.adapters.filter.Filter.Insts.CoreIterTraitsIteratorIterator
+  {I P Item : Type _}
+  (IA : core.iter.traits.iterator.Iterator I Item)
+  (PInst : core.ops.function.FnMut P Item Bool) :
+  core.iter.traits.iterator.Iterator (core.iter.adapters.filter.Filter I P) Item := {
+  next := core.iter.adapters.filter.Filter.Insts.CoreIterTraitsIteratorIterator.next IA PInst
+}
+
 @[rust_fun
   "core::iter::range::{core::iter::traits::iterator::Iterator<core::ops::range::Range<@A>, @A>}::next"]
 def core.iter.range.IteratorRange.next
@@ -975,10 +1288,6 @@ def core.ops.range.RangeInclusive.Insts.CoreIterTraitsDoubleEndedIterator.next_b
       | none => .fail .panic
       | some e' => ok (some self.«end», ⟨self.start, e', self.exhausted⟩)
     else
-      let n ← StepInst.cloneInst.clone self.end
+      let n ← StepInst.cloneInst.clone self.«end»
       ok (some n, ⟨self.start, self.«end», true⟩)
 
-@[rust_type "core::iter::adapters::map::Map"]
-structure core.iter.adapters.map.Map (I : Type u) (F : Type v) where
-  iter : I
-  f : F

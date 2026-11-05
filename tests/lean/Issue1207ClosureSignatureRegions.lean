@@ -25,34 +25,6 @@ namespace issue_1207_closure_signature_regions
 def core.num.nonzero.ZeroablePrimitive (Self : Type _) (T1 : Type _) : Type := sorry
 def core.cmp.clamp.ClampBounds (Self : Type _) (T1 : Type _) : Type := sorry
 
-/-- [core::iter::adapters::map::{impl core::iter::traits::iterator::Iterator<B> for core::iter::adapters::map::Map<I, F>}::next]:
-    Source: '/rustc/library/core/src/iter/adapters/map.rs', lines 106:4-106:35
-    Name pattern: [core::iter::adapters::map::{core::iter::traits::iterator::Iterator<core::iter::adapters::map::Map<@I, @F>, @B>}::next]
-    Visibility: public -/
-@[rust_fun
-  "core::iter::adapters::map::{core::iter::traits::iterator::Iterator<core::iter::adapters::map::Map<@I, @F>, @B>}::next"]
-def core.iter.adapters.map.Map.Insts.CoreIterTraitsIteratorIterator.next
-  {B : Type _} {I : Type _} {F : Type _} {Clause0_Item : Type _}
-  (traitsiteratorIteratorInst : core.iter.traits.iterator.Iterator I
-  Clause0_Item) (opsfunctionFnMutFTupleClause0_ItemBInst :
-  core.ops.function.FnMut F Clause0_Item B) :
-  core.iter.adapters.map.Map I F → Result ((Option B) ×
-    (core.iter.adapters.map.Map I F))
-  := sorry
-
-/-- [core::iter::traits::iterator::Iterator::map]:
-    Source: '/rustc/library/core/src/iter/traits/iterator.rs', lines 845:4-848:34
-    Name pattern: [core::iter::traits::iterator::Iterator::map]
-    Visibility: public -/
-@[trait_default, rust_fun "core::iter::traits::iterator::Iterator::map"]
-def core.iter.traits.iterator.Iterator.map.default
-  {Self : Type _} {B : Type _} {F : Type _} {Clause0_Item : Type _}
-  (IteratorInst : core.iter.traits.iterator.Iterator Self Clause0_Item)
-  (opsfunctionFnMutFTupleClause0_ItemBInst : core.ops.function.FnMut F
-  Clause0_Item B) :
-  Self → F → Result (core.iter.adapters.map.Map Self F)
-  := sorry
-
 /-- [issue_1207_closure_signature_regions::Holder]
     Source: 'tests/src/issue-1207-closure-signature-regions.rs', lines 8:0-8:24
     Visibility: public -/
@@ -122,7 +94,7 @@ def iter_of
   Result (core.iter.adapters.map.Map (core.ops.range.Range Std.I32)
     iter_of.closure)
   := do
-  core.iter.traits.iterator.Iterator.map.default
+  core.iter.traits.iterator.Iterator.map.trait_default
     (core.iter.traits.iterator.IteratorRange core.iter.range.StepI32)
     iter_of.closure.Insts.CoreOpsFunctionFnMutTupleI32U8
     { start := 0#i32, «end» := 1#i32 } x

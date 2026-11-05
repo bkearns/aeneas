@@ -25,19 +25,6 @@ namespace iter_return_borrowed_str
 def core.num.nonzero.ZeroablePrimitive (Self : Type _) (T1 : Type _) : Type := sorry
 def core.cmp.clamp.ClampBounds (Self : Type _) (T1 : Type _) : Type := sorry
 
-/-- [core::iter::traits::iterator::Iterator::map]:
-    Source: '/rustc/library/core/src/iter/traits/iterator.rs', lines 845:4-848:34
-    Name pattern: [core::iter::traits::iterator::Iterator::map]
-    Visibility: public -/
-@[trait_default, rust_fun "core::iter::traits::iterator::Iterator::map"]
-def core.iter.traits.iterator.Iterator.map.default
-  {Self : Type _} {B : Type _} {F : Type _} {Clause0_Item : Type _}
-  (IteratorInst : core.iter.traits.iterator.Iterator Self Clause0_Item)
-  (opsfunctionFnMutFTupleClause0_ItemBInst : core.ops.function.FnMut F
-  Clause0_Item B) :
-  Self → F → Result (core.iter.adapters.map.Map Self F)
-  := sorry
-
 /-- [alloc::string::{alloc::string::String}::as_str]:
     Source: '/rustc/library/alloc/src/string.rs', lines 1073:4-1073:38
     Name pattern: [alloc::string::{alloc::string::String}::as_str]
@@ -111,7 +98,7 @@ def Metadata.primary_key
   := do
   let s := alloc.vec.Vec.deref self.partition_key
   let i ← core.slice.Slice.iter s
-  core.iter.traits.iterator.Iterator.map.default
+  core.iter.traits.iterator.Iterator.map.trait_default
     (core.iter.traits.iterator.IteratorSliceIter String)
     alloc.string.String.as_str.Insts.CoreOpsFunctionFnMutTupleShared0StringShared0Str
     i (alloc.string.String.as_str)
@@ -126,7 +113,7 @@ def Metadata.all_keys
   := do
   let s := alloc.vec.Vec.deref self.clustering_key
   let i ← core.slice.Slice.iter s
-  core.iter.traits.iterator.Iterator.map.default
+  core.iter.traits.iterator.Iterator.map.trait_default
     (core.iter.traits.iterator.IteratorSliceIter String)
     alloc.string.String.as_str.Insts.CoreOpsFunctionFnMutTupleShared0StringShared0Str
     i (alloc.string.String.as_str)
@@ -141,7 +128,7 @@ def names
   := do
   let s := alloc.vec.Vec.deref m.partition_key
   let i ← core.slice.Slice.iter s
-  core.iter.traits.iterator.Iterator.map.default
+  core.iter.traits.iterator.Iterator.map.trait_default
     (core.iter.traits.iterator.IteratorSliceIter String)
     alloc.string.String.as_str.Insts.CoreOpsFunctionFnMutTupleShared0StringShared0Str
     i (alloc.string.String.as_str)

@@ -48,7 +48,7 @@ let default_subdir (kind : kind) backend test_name : string option =
 let apply_special_comment comment input =
   let comment = String.trim comment in
   (* Parse the backends if any *)
-  let re = Re.compile (Re.Pcre.re "^\\[(!)?([a-zA-Z,-]+)\\](.*)$") in
+  let re = Re.compile (Re.Pcre.re "^\\[(!)?([a-zA-Z0-9,-]+)\\](.*)$") in
   let (comment, (backends : Backend.t list)) =
     match Re.exec_opt re comment with
     | Some groups ->
